@@ -1,792 +1,443 @@
-import { useRef, useState, useEffect } from "react";
-import {
-  MapContainer,
-  TileLayer,
-  Polygon,
-  Circle,
-  Popup,
-  useMap,
-} from "react-leaflet";
-import L from "leaflet";
-import "@geoman-io/leaflet-geoman-free";
-import "@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css";
-import "./App.css";
+import { useRef, useState, useEffect } from 'react';
+import { MapContainer, TileLayer, useMap, CircleMarker, Popup } from 'react-leaflet';
+import L from 'leaflet';
+import '@geoman-io/leaflet-geoman-free';
+import '@geoman-io/leaflet-geoman-free/dist/leaflet-geoman.css';
 
-// Fix Leaflet default marker/icon paths
 delete L.Icon.Default.prototype._getIconUrl;
-
 L.Icon.Default.mergeOptions({
-  iconRetinaUrl:
-    "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon-2x.png",
-  iconUrl:
-    "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-icon.png",
-  shadowUrl:
-    "https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/images/marker-shadow.png",
+  iconRetinaUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon-2x.png',
+  iconUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-icon.png',
+  shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.7.1/images/marker-shadow.png',
 });
 
 function getPolygonAreaHectares(latlngs) {
-  if (!latlngs || latlngs.length < 3) return 0;
-
-  const points = latlngs.map((p) => ({
-    lat: p.lat,
-    lng: p.lng,
-  }));
-
   const earthRadius = 6378137;
   let area = 0;
-
-  for (let i = 0; i < points.length; i++) {
-    const p1 = points[i];
-    const p2 = points[(i + 1) % points.length];
-
-    const x1 =
-      (p1.lng * Math.PI) / 180 *
-      earthRadius *
-      Math.cos((p1.lat * Math.PI) / 180);
-
-    const y1 = (p1.lat * Math.PI) / 180 * earthRadius;
-
-    const x2 =
-      (p2.lng * Math.PI) / 180 *
-      earthRadius *
-      Math.cos((p2.lat * Math.PI) / 180);
-
-    const y2 = (p2.lat * Math.PI) / 180 * earthRadius;
-
+  for (let i = 0; i < latlngs.length; i++) {
+    const p1 = latlngs[i];
+    const p2 = latlngs[(i + 1) % latlngs.length];
+    const x1 = earthRadius * (p1.lng * Math.PI / 180) * Math.cos(p1.lat * Math.PI / 180);
+    const y1 = earthRadius * (p1.lat * Math.PI / 180);
+    const x2 = earthRadius * (p2.lng * Math.PI / 180) * Math.cos(p2.lat * Math.PI / 180);
+    const y2 = earthRadius * (p2.lat * Math.PI / 180);
     area += x1 * y2 - x2 * y1;
   }
-
-  return Math.abs(area) / 2 / 10000;
+  return Math.abs(area / 2) / 10000;
 }
 
-function DrawControl({ onPolygonCreated }) {
-  const map = useMap();
+function Tooltip({ text, children }) {
+  const [visible, setVisible] = useState(false);
+  return (
+    <span className='tooltip-wrapper' onMouseEnter={() => setVisible(true)} onMouseLeave={() => setVisible(false)}>
+      {children}
+      {visible && <span className='tooltip-box'>{text}</span>}
+    </span>
+  );
+}
 
+function DrawControl({ onPolygonCreated, initialColor }) {
+  const map = useMap();
   useEffect(() => {
     map.pm.addControls({
-      position: "topleft",
-      drawText: false,
-      drawCircle: false,
-      drawCircleMarker: false,
-      drawPolyline: false,
-      drawRectangle: false,
-      drawMarker: false,
-      drawPolygon: true,
-      editMode: false,
-      dragMode: false,
-      cutPolygon: false,
-      removalMode: false,
+      position: 'topright', drawCircle: false, drawCircleMarker: false,
+      drawPolyline: false, drawRectangle: false, drawMarker: false, drawText: false,
     });
-
-    map.on("pm:create", (e) => {
-      if (e.shape !== "Polygon") return;
-
-      const layer = e.layer;
+    map.pm.setPathOptions({ color: initialColor, fillColor: initialColor, fillOpacity: 0.4 });
+    const handleCreate = (event) => {
+      const layer = event.layer;
       const latlngs = layer.getLatLngs()[0];
-
-      const area = getPolygonAreaHectares(latlngs);
-      const geojson = layer.toGeoJSON();
-
-      onPolygonCreated({
-        layer,
-        area,
-        geojson,
-        latlngs,
-      });
-    });
-
-    return () => {
-      map.pm.removeControls();
-      map.off("pm:create");
+      const hectares = getPolygonAreaHectares(latlngs);
+      onPolygonCreated(layer.toGeoJSON(), hectares, layer);
     };
-  }, [map, onPolygonCreated]);
-
+    map.on('pm:create', handleCreate);
+    return () => { map.pm.removeControls(); map.off('pm:create', handleCreate); };
+  }, [map, onPolygonCreated, initialColor]);
   return null;
 }
 
-function MapEffects({ polygonLayer, validationZones }) {
+function MapController({ boundsToFit, reviewTrigger }) {
   const map = useMap();
-
   useEffect(() => {
-    if (!polygonLayer) return;
-
-    map.fitBounds(polygonLayer.getBounds(), {
-      padding: [30, 30],
-      maxZoom: 12,
-    });
-  }, [polygonLayer, map]);
-
-  return (
-    <>
-      {validationZones.map((zone) => (
-        <Circle
-          key={zone.id}
-          center={zone.position}
-          radius={zone.radius}
-          pathOptions={{
-            color: "#d97706",
-            fillColor: "#f59e0b",
-            fillOpacity: 0.28,
-            weight: 2,
-          }}
-        >
-          <Popup>
-            <strong>Adaptive Validation Zone</strong>
-            <br />
-            Priority: {zone.priority}
-            <br />
-            Reason: {zone.reason}
-          </Popup>
-        </Circle>
-      ))}
-    </>
-  );
+    if (boundsToFit && reviewTrigger > 0) {
+      map.fitBounds(boundsToFit, { padding: [50, 50], animate: true, duration: 1.5 });
+    }
+  }, [boundsToFit, reviewTrigger, map]);
+  return null;
 }
+
+const BIOME_COLORS = {
+  'Tropical Forest': '#2f7d4a',
+  'Temperate Forest': '#2b8a7b',
+  'Boreal Forest': '#1b4f2c',
+  'Savanna / Woodland': '#a38d29'
+};
+
+const BIOMASS_FACTORS = {
+  'Tropical Forest': 180, 'Temperate Forest': 120,
+  'Boreal Forest': 80, 'Savanna / Woodland': 55,
+};
 
 function App() {
   const mapRef = useRef(null);
-
   const [polygonGeoJSON, setPolygonGeoJSON] = useState(null);
   const [polygonLayer, setPolygonLayer] = useState(null);
   const [areaHa, setAreaHa] = useState(0);
-
-  const [biome, setBiome] = useState("Tropical Forest");
-
+  const [biome, setBiome] = useState('Tropical Forest');
   const [results, setResults] = useState(null);
-
-  const [status, setStatus] = useState(
-    "Draw a forest polygon on the map to begin analysis."
-  );
-
-  const [activeLayers, setActiveLayers] = useState({
-    sentinel2: true,
-    sentinel1SAR: false,
-    ndvi: false,
-  });
-
   const [validationZones, setValidationZones] = useState([]);
+  const [status, setStatus] = useState('Draw a forest area on the map to begin analysis.');
+  const [activeLayers, setActiveLayers] = useState({ sentinel2: true, sentinel1SAR: false, ndvi: false });
+  const [reviewTrigger, setReviewTrigger] = useState(0);
 
-  const biomassFactors = {
-    "Tropical Forest": 180,
-    "Temperate Forest": 120,
-    "Boreal Forest": 80,
-    "Savanna / Woodland": 55,
-  };
-
-  const forestProfiles = {
-    "Tropical Forest": {
-      baseline: "Dense evergreen canopy",
-      spectral: "High vegetation response",
-      sar: "Moderate–high structural response",
-      canopy: "High",
-    },
-    "Temperate Forest": {
-      baseline: "Seasonal mixed canopy",
-      spectral: "Moderate seasonal response",
-      sar: "Moderate structural response",
-      canopy: "Moderate–high",
-    },
-    "Boreal Forest": {
-      baseline: "Needleleaf-dominant canopy",
-      spectral: "Moderate vegetation response",
-      sar: "Moderate structural response",
-      canopy: "Moderate",
-    },
-    "Savanna / Woodland": {
-      baseline: "Open woodland structure",
-      spectral: "Seasonal vegetation response",
-      sar: "Lower structural response",
-      canopy: "Low–moderate",
-    },
-  };
-
-  const handlePolygonCreated = ({
-    layer,
-    area,
-    geojson,
-    latlngs,
-  }) => {
-    setPolygonLayer(layer);
-    setPolygonGeoJSON(geojson);
-    setAreaHa(area);
-
-    setResults(null);
-    setValidationZones([]);
-
-    setStatus(
-      `Polygon selected: ${area.toFixed(2)} hectares. Ready for analysis.`
-    );
-
-    // Keep a visible reference to the selected polygon
-    layer.setStyle({
-      color: "#2d5a27",
-      weight: 3,
-      fillColor: "#6aaa45",
-      fillOpacity: 0.22,
-    });
-
-    // Create a small visual layer effect inside the selected region
-    if (latlngs && latlngs.length >= 3) {
-      const center = latlngs.reduce(
-        (acc, point) => ({
-          lat: acc.lat + point.lat / latlngs.length,
-          lng: acc.lng + point.lng / latlngs.length,
-        }),
-        { lat: 0, lng: 0 }
-      );
-
-      setValidationZones([
-        {
-          id: "preview",
-          position: [center.lat, center.lng],
-          radius: Math.max(150, Math.min(700, area * 12)),
-          priority: "Pending",
-          reason: "Awaiting forest analysis",
-        },
-      ]);
+  useEffect(() => {
+    if (polygonLayer) {
+      polygonLayer.setStyle({ color: BIOME_COLORS[biome], fillColor: BIOME_COLORS[biome] });
     }
-  };
+    const map = mapRef.current;
+    if (map && map.pm) {
+      map.pm.setPathOptions({ color: BIOME_COLORS[biome], fillColor: BIOME_COLORS[biome], fillOpacity: 0.4 });
+    }
+  }, [biome, polygonLayer]);
 
-  const analyzeForest = () => {
+  function handlePolygonCreated(geojson, hectares, layer) {
+    if (polygonLayer) { mapRef.current.removeLayer(polygonLayer); }
+    setPolygonGeoJSON(geojson); setAreaHa(hectares); setPolygonLayer(layer);
+    layer.setStyle({ color: BIOME_COLORS[biome], fillColor: BIOME_COLORS[biome] });
+    setValidationZones([]); setResults(null); setReviewTrigger(0);
+    setStatus(`Forest area selected: ${hectares.toFixed(2)} ha. Click Analyze Forest.`);
+  }
+
+  function analyzeForest() {
     if (!polygonGeoJSON || areaHa <= 0) {
-      setStatus("Please draw a forest polygon first.");
-      return;
+      setStatus('Please draw a forest polygon first.'); return;
     }
-
-    setStatus("Analysing multi-sensor forest evidence...");
-    setResults(null);
-
+    setStatus('Analyzing forest indicators...');
+    
     setTimeout(() => {
-      // Prototype values.
-      // These represent a simulated MVP workflow, not live satellite inference.
       const simulatedCurrentNDVI = 0.68;
-      const simulatedPreviousNDVI = 0.74;
-
-      const canopyFraction = Math.min(
-        0.92,
-        Math.max(0.35, 0.55 + areaHa / 1000)
-      );
-
+      const canopyFraction = Math.max(0, Math.min(1, (simulatedCurrentNDVI - 0.30) / (0.85 - 0.30)));
       const canopyCoverPercent = canopyFraction * 100;
-
-      const treesPerHectare = Math.round(
-        120 + canopyFraction * 480
-      );
-
-      const estimatedTrees = Math.round(
-        areaHa * treesPerHectare
-      );
-
-      const uncertainty = Math.max(
-        500,
-        Math.round(estimatedTrees * 0.18)
-      );
-
-      const biomassFactor = biomassFactors[biome];
-
-      const agbTonnes =
-        areaHa * canopyFraction * biomassFactor;
-
-      const agbPerHa =
-        areaHa > 0 ? agbTonnes / areaHa : 0;
-
+      
+      const treesPerHectare = Math.round(120 + canopyFraction * 480);
+      const estimatedTrees = Math.round(areaHa * treesPerHectare);
+      const uncertainty = Math.round(estimatedTrees * 0.20); 
+      
+      const biomassFactor = BIOMASS_FACTORS[biome];
+      const agbDensity = canopyFraction * biomassFactor;
+      const agbDensityUncertainty = agbDensity * 0.15;
+      const agbTonnes = areaHa * agbDensity;
       const carbonTonnes = agbTonnes * 0.47;
       const co2eTonnes = carbonTonnes * 3.67;
-
-      const lossPercent = Math.max(
-        0,
-        ((simulatedPreviousNDVI - simulatedCurrentNDVI) /
-          simulatedPreviousNDVI) *
-          100
-      );
-
-      let alert = "NORMAL";
-      let alertLevel = "low";
-
-      if (lossPercent > 15) {
-        alert = "ALERT";
-        alertLevel = "high";
-      } else if (lossPercent > 5) {
-        alert = "REVIEW";
-        alertLevel = "medium";
+      
+      const lossPercent = 6; 
+      let alertStatus = 'REVIEW';
+      
+      const bounds = polygonLayer.getBounds();
+      const n = bounds.getNorth();
+      const s = bounds.getSouth();
+      const e = bounds.getEast();
+      const w = bounds.getWest();
+      const latDiff = n - s;
+      const lngDiff = e - w;
+      
+      const latlngs = polygonLayer.getLatLngs()[0];
+      function isPointInPolygon(lat, lng) {
+        let inside = false;
+        for (let i = 0, j = latlngs.length - 1; i < latlngs.length; j = i++) {
+          const xi = latlngs[i].lat, yi = latlngs[i].lng;
+          const xj = latlngs[j].lat, yj = latlngs[j].lng;
+          const intersect = ((yi > lng) !== (yj > lng)) && (lat < (xj - xi) * (lng - yi) / (yj - yi) + xi);
+          if (intersect) inside = !inside;
+        }
+        return inside;
       }
 
-      // Simulated Forest Fingerprint deviation
-      const fingerprintDeviation =
-        lossPercent > 8
-          ? "High deviation"
-          : lossPercent > 4
-          ? "Moderate deviation"
-          : "Within baseline";
+      const candidates = [];
+      const steps = 12;
+      for (let i = 1; i < steps; i++) {
+        for (let j = 1; j < steps; j++) {
+          const lat = s + (latDiff * i) / steps;
+          const lng = w + (lngDiff * j) / steps;
+          if (isPointInPolygon(lat, lng)) {
+            candidates.push({ lat, lng });
+          }
+        }
+      }
 
-      // Adaptive validation prioritises uncertain/anomalous zones
-      const validationPriority =
-        alertLevel === "high"
-          ? "High"
-          : alertLevel === "medium"
-          ? "Medium"
-          : "Low";
+      const selected = [];
+      if (candidates.length > 0) selected.push(candidates[Math.floor(candidates.length * 0.1)]);
+      if (candidates.length > 1) selected.push(candidates[Math.floor(candidates.length * 0.5)]);
+      if (candidates.length > 2) selected.push(candidates[Math.floor(candidates.length * 0.9)]);
 
-      setResults({
-        canopyCoverPercent,
-        currentNDVI: simulatedCurrentNDVI,
-        previousNDVI: simulatedPreviousNDVI,
-        estimatedTrees,
-        uncertainty,
-        treesPerHectare,
-        agbTonnes,
-        agbPerHa,
-        carbonTonnes,
-        co2eTonnes,
-        lossPercent,
-        alert,
-        alertLevel,
-        fingerprintDeviation,
-        validationPriority,
-        evidence: {
-          optical: true,
-          sar: activeLayers.sentinel1SAR,
-          temporal: true,
-          fingerprint: true,
-        },
+      const zoneConfigs = [
+        { priority: 'HIGH PRIORITY', color: '#ef4444', radius: 12, reason: 'High uncertainty + fingerprint deviation' },
+        { priority: 'REVIEW', color: '#f97316', radius: 8, reason: 'Moderate deviation' },
+        { priority: 'STABLE', color: '#22c55e', radius: 8, reason: 'Stable forest' }
+      ];
+
+      const newZones = selected.map((pt, idx) => {
+        const config = zoneConfigs[idx % zoneConfigs.length];
+        return {
+          id: idx + 1,
+          lat: pt.lat,
+          lng: pt.lng,
+          priority: config.priority,
+          color: config.color,
+          radius: config.radius,
+          reason: config.reason
+        };
       });
 
-      // Put validation zone near the centre of the selected polygon
-      if (polygonLayer) {
-        const center = polygonLayer.getBounds().getCenter();
-
-        setValidationZones([
-          {
-            id: "validation-1",
-            position: [center.lat, center.lng],
-            radius: Math.max(
-              180,
-              Math.min(850, areaHa * 15)
-            ),
-            priority: validationPriority,
-            reason:
-              alertLevel === "low"
-                ? "Low uncertainty / stable baseline"
-                : "Deviation requires targeted high-resolution validation",
-          },
-        ]);
-      }
-
-      setStatus(
-        "Analysis complete. Evidence summary is shown below."
-      );
+      setValidationZones(newZones);
+      setResults({
+        currentNDVI: simulatedCurrentNDVI,
+        canopyCoverPercent,
+        estimatedTrees, uncertainty, treesPerHectare,
+        agbDensity, agbDensityUncertainty, agbTonnes, carbonTonnes, co2eTonnes,
+        lossPercent, alertStatus,
+        evidenceConfidence: 87,
+        fingerprintDeviation: 18,
+      });
+      setStatus('Analysis complete. Review the evidence and priority zones.');
     }, 1200);
-  };
+  }
 
-  const clearMap = () => {
-    if (polygonLayer && mapRef.current) {
-      mapRef.current.removeLayer(polygonLayer);
-    }
+  function handleReviewPriorityZones() {
+    setReviewTrigger(prev => prev + 1);
+    setStatus('Priority validation zones highlighted on the map.');
+  }
 
-    setPolygonGeoJSON(null);
-    setPolygonLayer(null);
-    setAreaHa(0);
-    setResults(null);
-    setValidationZones([]);
-
-    setStatus(
-      "Draw a forest polygon on the map to begin analysis."
-    );
-  };
-
-  const downloadGeoJSON = () => {
-    if (!polygonGeoJSON) return;
-
-    const blob = new Blob(
-      [JSON.stringify(polygonGeoJSON, null, 2)],
-      { type: "application/json" }
-    );
-
+  function downloadGeoJSON() {
+    if (!polygonGeoJSON) { setStatus('Draw a box first before saving.'); return; }
+    const data = JSON.stringify(polygonGeoJSON, null, 2);
+    const blob = new Blob([data], { type: 'application/geo+json' });
     const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url; link.download = 'sylvasense-forest-boundary.geojson'; link.click();
+    URL.revokeObjectURL(url); setStatus('File saved.');
+  }
 
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "sylvasense-forest-polygon.geojson";
-    link.click();
+  function clearMap() {
+    const map = mapRef.current;
+    if (map) {
+      map.eachLayer((layer) => {
+        if (layer instanceof L.Polygon || layer instanceof L.Polyline) { map.removeLayer(layer); }
+      });
+    }
+    setPolygonGeoJSON(null); setPolygonLayer(null); setAreaHa(0); setResults(null); setValidationZones([]); setReviewTrigger(0);
+    setStatus('Map cleared. Draw a new forest area.');
+  }
 
-    URL.revokeObjectURL(url);
-  };
-
-  const toggleLayer = (layer) => {
-    setActiveLayers((previous) => ({
-      ...previous,
-      [layer]: !previous[layer],
-    }));
-  };
-
-  const profile = forestProfiles[biome];
+  function toggleLayer(layerName) { setActiveLayers(p => ({ ...p, [layerName]: !p[layerName] })); }
 
   return (
     <div className="app">
       <header className="header">
-        <div>
-          <h1>SYLVASENSE</h1>
-          <p>
-            Evidence-Backed Forest Intelligence
-          </p>
-        </div>
-
-        <div className="header-badge">
-          ORION-PS-03
-        </div>
+        <h1>🌳 SYLVASENSE</h1>
+        <p>Forest Intelligence & Evidence Monitoring | Earth Observation • Computer Vision • Climate Tech</p>
       </header>
 
-      <main className="main-content">
-        <section className="toolbar">
-          <div className="control-group">
-            <label>Forest Type</label>
-
-            <select
-              value={biome}
-              onChange={(e) => {
-                setBiome(e.target.value);
-                setResults(null);
-                setStatus(
-                  `${e.target.value} selected. Draw a polygon or analyse an existing one.`
-                );
-              }}
-            >
-              <option>Tropical Forest</option>
-              <option>Temperate Forest</option>
-              <option>Boreal Forest</option>
-              <option>Savanna / Woodland</option>
-            </select>
+      <main className="container">
+        <div className="toolbar">
+          <div className="toolbar-section">
+            <strong>Data Layers</strong>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={activeLayers.sentinel2} onChange={() => toggleLayer('sentinel2')} />
+              <Tooltip text="Sentinel-2 Optical Satellite Photos"><span className="term">Satellite Photos</span></Tooltip>
+            </label>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={activeLayers.sentinel1SAR} onChange={() => toggleLayer('sentinel1SAR')} />
+              <Tooltip text="Sentinel-1 SAR Radar View Overlay (Prototype)"><span className="term">Radar View</span></Tooltip>
+            </label>
+            <label className="checkbox-label">
+              <input type="checkbox" checked={activeLayers.ndvi} onChange={() => toggleLayer('ndvi')} />
+              <Tooltip text="Canopy density visualization (Prototype)"><span className="term">Canopy Density</span></Tooltip>
+            </label>
           </div>
 
-          <div className="control-group">
-            <label>Data Layers</label>
-
-            <div className="layer-buttons">
-              <button
-                className={
-                  activeLayers.sentinel2
-                    ? "layer-btn active"
-                    : "layer-btn"
-                }
-                onClick={() => toggleLayer("sentinel2")}
-              >
-                🛰️ Optical
-              </button>
-
-              <button
-                className={
-                  activeLayers.sentinel1SAR
-                    ? "layer-btn active"
-                    : "layer-btn"
-                }
-                onClick={() => toggleLayer("sentinel1SAR")}
-              >
-                📡 SAR
-              </button>
-
-              <button
-                className={
-                  activeLayers.ndvi
-                    ? "layer-btn active"
-                    : "layer-btn"
-                }
-                onClick={() => toggleLayer("ndvi")}
-              >
-                🌿 NDVI
-              </button>
-            </div>
+          <div className="toolbar-section">
+            <label>
+              <strong>Forest Type</strong>
+              <select value={biome} onChange={(e) => setBiome(e.target.value)} style={{ display: 'block', width: '100%', marginTop: '6px', padding: '8px' }}>
+                <option>Tropical Forest</option>
+                <option>Temperate Forest</option>
+                <option>Boreal Forest</option>
+                <option>Savanna / Woodland</option>
+              </select>
+            </label>
           </div>
 
-          <div className="toolbar-actions">
-            <button
-              className="btn-primary"
-              onClick={analyzeForest}
-            >
-              Analyse Forest
-            </button>
-
-            <button
-              className="btn-secondary"
-              onClick={clearMap}
-            >
-              Clear
-            </button>
+          <div className="toolbar-section" style={{display: "flex", gap: "8px", alignItems: "flex-end"}}>
+            <button onClick={analyzeForest} className="btn-primary">Analyze Forest</button>
+            <button onClick={downloadGeoJSON} className="btn-secondary">Save GeoJSON</button>
+            <button onClick={clearMap} className="btn-secondary">Clear</button>
           </div>
-        </section>
-
-        <div className="status-bar">
-          <span className="status-dot"></span>
-          {status}
         </div>
 
-        <section className="workspace">
-          <div className="map-panel">
+        <div className="status-bar">
+          <span className="status-icon">●</span> {status}
+        </div>
+
+        <div className="main-grid">
+          <section className="map-panel" style={{position: "relative"}}>
             <div className="panel-header">
-              <div>
-                <h2>Forest Analysis Map</h2>
-                <p>
-                  Select a polygon to analyse forest conditions
-                </p>
-              </div>
+              <h3>Map</h3>
+            </div>
+            
+            {activeLayers.sentinel1SAR && <div className="radar-overlay"></div>}
+            {activeLayers.ndvi && <div className="canopy-overlay"></div>}
 
-              {areaHa > 0 && (
-                <span className="area-badge">
-                  {areaHa.toFixed(2)} ha
-                </span>
+            <MapContainer center={[-3.4653, -62.2159]} zoom={5} className="map" ref={mapRef}>
+              {polygonLayer && reviewTrigger > 0 && (
+                <MapController boundsToFit={polygonLayer.getBounds()} reviewTrigger={reviewTrigger} />
               )}
-            </div>
-
-            <div className="map-container">
-              <MapContainer
-                center={[-3.4653, -62.2159]}
-                zoom={5}
-                style={{ height: "100%", width: "100%" }}
-                ref={mapRef}
-              >
-                <TileLayer
-                  attribution='&copy; OpenStreetMap contributors'
-                  url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-                />
-
-                <DrawControl
-                  onPolygonCreated={handlePolygonCreated}
-                />
-
-                <MapEffects
-                  polygonLayer={polygonLayer}
-                  validationZones={validationZones}
-                />
-
-                {polygonLayer && (
-                  <Polygon
-                    positions={polygonLayer.getLatLngs()[0]}
-                    pathOptions={{
-                      color:
-                        biome === "Tropical Forest"
-                          ? "#15803d"
-                          : biome === "Temperate Forest"
-                          ? "#2563eb"
-                          : biome === "Boreal Forest"
-                          ? "#0891b2"
-                          : "#ca8a04",
-                      fillColor:
-                        biome === "Tropical Forest"
-                          ? "#22c55e"
-                          : biome === "Temperate Forest"
-                          ? "#60a5fa"
-                          : biome === "Boreal Forest"
-                          ? "#67e8f9"
-                          : "#facc15",
-                      fillOpacity: 0.25,
-                      weight: 3,
-                    }}
-                  />
-                )}
-              </MapContainer>
-
-              <div className="map-legend">
-                <strong>Map Legend</strong>
-
-                <div>
-                  <span className="legend-dot normal"></span>
-                  Selected Forest
-                </div>
-
-                <div>
-                  <span className="legend-dot validation"></span>
-                  Validation Priority Zone
-                </div>
-              </div>
-            </div>
-
-            <div className="map-footer">
-              <span>
-                🌲 Profile: <strong>{biome}</strong>
-              </span>
-
-              <span>
-                Baseline: <strong>{profile.baseline}</strong>
-              </span>
-
-              {polygonGeoJSON && (
-                <button
-                  className="download-btn"
-                  onClick={downloadGeoJSON}
+              {activeLayers.sentinel2 ? (
+                <TileLayer attribution="&copy; Esri &mdash; Source: Esri, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EAP, and the GIS User Community" url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}" />
+              ) : (
+                <TileLayer attribution="&copy; OpenStreetMap" url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
+              )}
+              <DrawControl onPolygonCreated={handlePolygonCreated} initialColor={BIOME_COLORS[biome]} />
+              
+              {validationZones.map(zone => (
+                <CircleMarker 
+                  key={zone.id} 
+                  center={[zone.lat, zone.lng]} 
+                  radius={reviewTrigger > 0 ? zone.radius * 1.5 : zone.radius} 
+                  pathOptions={{ 
+                    color: zone.color, 
+                    fillColor: zone.color, 
+                    fillOpacity: 0.9,
+                    weight: reviewTrigger > 0 && zone.priority === 'HIGH PRIORITY' ? 4 : 2 
+                  }}
+                  className={reviewTrigger > 0 ? 'pulse-marker' : ''}
                 >
-                  ↓ Export GeoJSON
-                </button>
-              )}
+                  <Popup>
+                    <strong>Validation Priority</strong><br/>
+                    <span style={{color: zone.color, fontWeight: 'bold'}}>{zone.priority}</span><br/><br/>
+                    <b>Reason:</b> {zone.reason}<br/>
+                    <b>Recommended Action:</b><br/>High-resolution validation
+                  </Popup>
+                </CircleMarker>
+              ))}
+            </MapContainer>
+            
+            <div className="map-legend">
+              <div><strong>FOREST DENSITY:</strong></div>
+              <div><span className="legend-color" style={{background: '#2f7d4a'}}></span>Low</div>
+              <div><span className="legend-color" style={{background: '#7CFC00'}}></span>Moderate</div>
+              <div><span className="legend-color" style={{background: '#f97316'}}></span>High</div>
+              <div style={{marginLeft: "16px"}}><strong>VALIDATION PRIORITY:</strong></div>
+              <div><span className="legend-color" style={{background: '#22c55e', borderRadius: '50%'}}></span>Stable</div>
+              <div><span className="legend-color" style={{background: '#f97316', borderRadius: '50%'}}></span>Review</div>
+              <div><span className="legend-color" style={{background: '#ef4444', borderRadius: '50%'}}></span>High Priority</div>
             </div>
-          </div>
+          </section>
 
-          <aside className="results-panel">
+          <aside className="metrics-panel">
             <div className="panel-header">
-              <div>
-                <h2>Forest Intelligence</h2>
-                <p>Evidence-backed prototype outputs</p>
-              </div>
+              <h3>FOREST ANALYSIS</h3>
             </div>
-
-            {!results ? (
+            
+            {!results && (
               <div className="empty-state">
-                <div className="empty-icon">🌳</div>
-
-                <h3>Ready for Analysis</h3>
-
-                <p>
-                  Draw a forest polygon on the map and
-                  click <strong>Analyse Forest</strong>.
-                </p>
+                <div className="empty-state-icon">🌲</div>
+                <p>Draw a forest polygon and click<br/><b>"Analyze Forest"</b> to generate:</p>
+                <ul className="empty-state-list">
+                  <li>Canopy assessment</li>
+                  <li>Tree population estimate</li>
+                  <li>Biomass estimate</li>
+                  <li>Forest fingerprint</li>
+                  <li>Evidence confidence</li>
+                  <li>Adaptive validation</li>
+                </ul>
               </div>
-            ) : (
+            )}
+
+            {results && (
               <>
-                <div className="metrics-grid">
-                  <div className="metric-card">
-                    <span>Area</span>
-                    <strong>
-                      {areaHa.toFixed(1)} ha
-                    </strong>
-                  </div>
-
-                  <div className="metric-card">
-                    <span>Canopy Cover</span>
-                    <strong>
-                      {results.canopyCoverPercent.toFixed(1)}%
-                    </strong>
-                  </div>
-
-                  <div className="metric-card">
-                    <span>Tree Population</span>
-                    <strong>
-                      {results.estimatedTrees.toLocaleString()}
-                    </strong>
-
-                    <small>
-                      ±{" "}
-                      {results.uncertainty.toLocaleString()} stems
-                    </small>
-                  </div>
-
-                  <div className="metric-card">
-                    <span>AGB</span>
-                    <strong>
-                      {results.agbPerHa.toFixed(1)}
-                    </strong>
-
-                    <small>Mg/ha</small>
-                  </div>
+                <div className="metric-card">
+                  <div className="metric-label">Area</div>
+                  <div className="metric-value">{areaHa.toFixed(2)} ha</div>
                 </div>
 
-                <div className="fingerprint-card">
-                  <div className="section-title">
-                    🌲 Forest Fingerprint
-                  </div>
-
-                  <div className="fingerprint-grid">
-                    <div>
-                      <span>Spectral</span>
-                      <strong>{profile.spectral}</strong>
-                    </div>
-
-                    <div>
-                      <span>SAR</span>
-                      <strong>{profile.sar}</strong>
-                    </div>
-
-                    <div>
-                      <span>Canopy</span>
-                      <strong>{profile.canopy}</strong>
-                    </div>
-
-                    <div>
-                      <span>Deviation</span>
-                      <strong>
-                        {results.fingerprintDeviation}
-                      </strong>
-                    </div>
-                  </div>
+                <div className="metric-card highlight">
+                  <div className="metric-label">Estimated Tree Population</div>
+                  <div className="metric-value">{results.estimatedTrees.toLocaleString()} ± {results.uncertainty.toLocaleString()}</div>
+                  <div className="metric-sub">stems (Demo estimate)</div>
+                  <div className="metric-sub">Tree Density: {results.treesPerHectare} stems/ha</div>
                 </div>
 
-                <div className="evidence-card">
-                  <div className="section-title">
-                    📊 Evidence Fusion
-                  </div>
-
-                  <div className="evidence-list">
-                    <div>
-                      Optical
-                      <span>
-                        {results.evidence.optical ? "✓" : "—"}
-                      </span>
-                    </div>
-
-                    <div>
-                      SAR
-                      <span>
-                        {results.evidence.sar ? "✓" : "—"}
-                      </span>
-                    </div>
-
-                    <div>
-                      Temporal
-                      <span>
-                        {results.evidence.temporal ? "✓" : "—"}
-                      </span>
-                    </div>
-
-                    <div>
-                      Fingerprint
-                      <span>
-                        {results.evidence.fingerprint ? "✓" : "—"}
-                      </span>
-                    </div>
-                  </div>
+                <div className="metric-card">
+                  <div className="metric-label">Canopy Cover</div>
+                  <div className="metric-value">{results.canopyCoverPercent.toFixed(1)}%</div>
+                  <div className="metric-sub">Current NDVI: {results.currentNDVI.toFixed(3)} (Demo estimate)</div>
                 </div>
 
-                <div
-                  className={`alert-card ${results.alertLevel}`}
-                >
-                  <div>
-                    <span>Forest Status</span>
-                    <strong>{results.alert}</strong>
-                  </div>
-
-                  <div>
-                    <span>Canopy Change</span>
-                    <strong>
-                      {results.lossPercent.toFixed(1)}%
-                    </strong>
-                  </div>
+                <div className="metric-card">
+                  <div className="metric-label">ABOVEGROUND BIOMASS</div>
+                  <div className="metric-value">{results.agbDensity.toFixed(1)} ± {results.agbDensityUncertainty.toFixed(1)} Mg/ha</div>
+                  <div className="metric-sub">Total Biomass: {results.agbTonnes.toFixed(1)} t</div>
+                  <div className="metric-sub">Reference: ESA CCI Biomass / GEDI where suitable coverage exists</div>
+                  <div className="metric-sub" style={{marginTop: '4px'}}><strong>Carbon Stock:</strong> {results.carbonTonnes.toFixed(1)} tC</div>
+                  <div className="metric-sub"><strong>CO₂ Equivalent:</strong> {results.co2eTonnes.toFixed(1)} tCO₂e</div>
                 </div>
 
-                <div className="validation-card">
-                  <div>
-                    <span>🔍 Adaptive Validation</span>
-                    <strong>
-                      {results.validationPriority} Priority
-                    </strong>
-                  </div>
-
-                  <p>
-                    Zones showing higher deviation or
-                    uncertainty are prioritised for
-                    high-resolution validation.
-                  </p>
+                <div className="metric-card" style={{background: "#f9f9f9", border: "1px solid #ccc"}}>
+                  <div className="metric-label">FOREST FINGERPRINT</div>
+                  <div className="metric-sub" style={{fontStyle: 'italic', marginBottom: '8px'}}>Compared with the forest's historical baseline</div>
+                  <div className="metric-sub">Spectral Profile: Stable ✓</div>
+                  <div className="metric-sub">SAR Profile: Stable ✓</div>
+                  <div className="metric-sub">Canopy Structure: Stable ✓</div>
+                  <div className="metric-sub">Temporal Behaviour: Slight Deviation ⚠</div>
+                  <div className="metric-sub" style={{marginTop: '4px'}}><strong>Overall Fingerprint Deviation:</strong> {results.fingerprintDeviation}%</div>
                 </div>
 
-                <div className="prototype-note">
-                  Prototype output: satellite inference,
-                  validation and uncertainty values are
-                  simulated for the current MVP.
+                <div className="metric-card" style={{background: "#f9f9f9", border: "1px solid #ccc"}}>
+                  <div className="metric-label">EVIDENCE FUSION</div>
+                  <div className="metric-sub">Optical Signal: ✓</div>
+                  <div className="metric-sub">SAR Signal: ✓</div>
+                  <div className="metric-sub">Temporal Persistence: ✓</div>
+                  <div className="metric-sub">Fingerprint Deviation: ⚠</div>
+                  <div className="metric-sub" style={{marginTop: '4px'}}>
+                    <strong>Evidence Confidence:</strong> <span style={{fontSize: '16px', fontWeight: 'bold'}}>{results.evidenceConfidence}%</span>
+                  </div>
+                  <div className="metric-sub" style={{marginTop: '6px', display: 'flex', alignItems: 'center', gap: '8px'}}>
+                    <strong>Status:</strong> 
+                    <span className={`status-badge status-${results.alertStatus.toLowerCase()}`}>{results.alertStatus}</span>
+                  </div>
+                </div>
+                
+                <div className="metric-card" style={{background: "#fff3e0", border: "1px solid #ffb74d"}}>
+                  <div className="metric-label">ADAPTIVE VALIDATION</div>
+                  <div className="metric-sub" style={{fontStyle: 'italic', marginBottom: '8px'}}>High-resolution validation is prioritized only where uncertainty or anomaly signals are strongest.</div>
+                  <div className="metric-sub"><strong>3 zones require review</strong></div>
+                  <ul style={{fontSize: "12px", margin: "4px 0", paddingLeft: "16px"}}>
+                    <li>Zone A (High uncertainty) → Priority: <span style={{color: '#ef4444', fontWeight: 'bold'}}>HIGH</span></li>
+                    <li>Zone B (Fingerprint deviation) → Priority: <span style={{color: '#f97316', fontWeight: 'bold'}}>REVIEW</span></li>
+                    <li>Zone C (Stable forest) → No additional validation required</li>
+                  </ul>
+                  <button className="btn-secondary" style={{marginTop: "12px", width: "100%", fontSize: "13px", padding: "8px", fontWeight: "bold"}} onClick={handleReviewPriorityZones}>
+                    Review Priority Zones
+                  </button>
                 </div>
               </>
             )}
           </aside>
-        </section>
+        </div>
+        
+        <div className="workflow-panel">
+          <h4>HOW SYLVASENSE REACHED THIS RESULT (Intended workflow)</h4>
+          <p>SELECT FOREST → ANALYZE → CANOPY → TREE POPULATION → BIOMASS → CHANGE DETECTION → EVIDENCE FUSION → ADAPTIVE VALIDATION</p>
+        </div>
+
+        <div className="disclaimer-box">
+          <strong>Prototype Notice:</strong>
+          <p>Analysis values shown in this prototype are demonstrative. Production deployment would connect real satellite imagery, calibrated forest inventories and validated high-resolution reference data.</p>
+        </div>
       </main>
     </div>
   );
 }
 
 export default App;
-
