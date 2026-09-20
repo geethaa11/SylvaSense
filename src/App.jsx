@@ -235,7 +235,8 @@ function App() {
     <div className="app">
       <header className="header">
         <h1>🌳 SYLVASENSE</h1>
-        <p>Forest Intelligence & Evidence Monitoring | Earth Observation • Computer Vision • Climate Tech</p>
+        <p style={{ fontWeight: '600', fontSize: '18px', color: '#2d5a27', marginBottom: '4px', marginTop: '4px' }}>Where Every Pixel Reveals a Piece of the Forest</p>
+        <p style={{ marginTop: '0' }}>Earth Observation • Computer Vision • Tree Enumeration • Biomass • Forest Change</p>
       </header>
 
       <main className="container">
