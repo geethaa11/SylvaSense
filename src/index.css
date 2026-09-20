@@ -263,14 +263,15 @@ button {
 }
 
 .leaflet-control-zoom a {
-  background: #ffffff !important;
+  background-color: #ffffff !important;
   color: #2d5a27 !important;
   border-color: #c8dcc0 !important;
 }
 
 .leaflet-control-zoom a:hover {
-  background: #f0f8e8 !important;
+  background-color: #f0f8e8 !important;
 }
+
 
 .leaflet-control-attribution {
   background: rgba(255, 255, 255, 0.85) !important;
@@ -410,10 +411,12 @@ button {
 .leaflet-pm-toolbar a {
   background-color: #ffffff !important;
   border: 1px solid #c8dcc0 !important;
+  color: #2d5a27 !important;
 }
 
-.leaflet-pm-toolbar a:hover {
-  background: #f0f8e8 !important;
+.leaflet-pm-toolbar a:hover,
+.leaflet-pm-toolbar a.active {
+  background-color: #f0f8e8 !important;
 }
 
 /* Tablet */
