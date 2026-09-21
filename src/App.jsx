@@ -104,9 +104,12 @@ function App() {
   const [demoObjects, setDemoObjects] = useState([]);
   
   const [liveDataStatus, setLiveDataStatus] = useState({ backend: 'Checking...', satellite: 'Unknown', raster: 'Unknown' });
+  const [isAnalyzing, setIsAnalyzing] = useState(false);
+
+  const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8001';
 
   useEffect(() => {
-    fetch('http://127.0.0.1:8001/api/health')
+    fetch(`${API_BASE_URL}/api/health`)
       .then(res => res.json())
       .then(data => setLiveDataStatus(data))
       .catch(() => setLiveDataStatus({ backend: 'Unavailable', satellite: 'Unavailable', raster: 'Unavailable' }));
@@ -227,12 +230,14 @@ function App() {
   }
 
   function selectMeasurement(type) {
+    if (isAnalyzing) return;
+    setIsAnalyzing(true);
     setRequestedMeasurement(type);
     setStatus('Searching satellite data...');
     setAnalysisResult(null);
     setProofOpen(false);
 
-    fetch('http://127.0.0.1:8001/api/analyze', {
+    fetch(`${API_BASE_URL}/api/analyze`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ aoi: polygonGeoJSON, measurement: type })
@@ -242,6 +247,7 @@ function App() {
       return res.json();
     })
     .then(data => {
+      setIsAnalyzing(false);
       if (data.api_state === 'NO_DATA') {
          setStatus('REVIEW — No suitable satellite data found');
          handleApiFailure(type, data);
@@ -254,8 +260,10 @@ function App() {
       }
     })
     .catch(err => {
+      console.error(err);
+      setIsAnalyzing(false);
       setStatus('REVIEW — Live analysis service unavailable');
-      handleApiFailure(type, { api_state: 'BACKEND_UNAVAILABLE', reason: 'Live analysis service unavailable', metadata_found: null });
+      handleApiFailure(type, { api_state: 'BACKEND_UNAVAILABLE', reason: 'Live analysis service unavailable. Please check the backend connection.', metadata_found: null });
     });
   }
 
@@ -502,19 +510,19 @@ function App() {
               <div className="measurement-selection">
                 <h3 className="section-title">WHAT DO YOU WANT TO MEASURE?</h3>
                 <div className="cards-grid">
-                  <div className="meas-card" onClick={() => selectMeasurement('ENUMERATION')}>
+                  <div className={`meas-card ${isAnalyzing ? 'disabled-card' : ''}`} onClick={() => selectMeasurement('ENUMERATION')}>
                     <h4>🌳 Tree / Canopy Enumeration</h4>
                     <p>Estimate tree/canopy objects and density.</p>
                   </div>
-                  <div className="meas-card" onClick={() => selectMeasurement('STRUCTURE')}>
+                  <div className={`meas-card ${isAnalyzing ? 'disabled-card' : ''}`} onClick={() => selectMeasurement('STRUCTURE')}>
                     <h4>🌲 Forest Structure</h4>
                     <p>Assess canopy cover / structure at supported resolution.</p>
                   </div>
-                  <div className="meas-card" onClick={() => selectMeasurement('BIOMASS')}>
+                  <div className={`meas-card ${isAnalyzing ? 'disabled-card' : ''}`} onClick={() => selectMeasurement('BIOMASS')}>
                     <h4>🪵 Aboveground Biomass</h4>
                     <p>Estimate AGB from multi-source features and reference biomass.</p>
                   </div>
-                  <div className="meas-card" onClick={() => selectMeasurement('CHANGE')}>
+                  <div className={`meas-card ${isAnalyzing ? 'disabled-card' : ''}`} onClick={() => selectMeasurement('CHANGE')}>
                     <h4>🔥 Forest Change</h4>
                     <p>Assess evidence of temporal forest change/disturbance.</p>
                   </div>
