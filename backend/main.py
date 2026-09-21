@@ -1,7 +1,9 @@
 import os
+from dotenv import load_dotenv
 import json
 import logging
 import numpy as np
+load_dotenv()
 import rasterio
 from rasterio.features import shapes
 from rasterio.mask import mask
@@ -74,26 +76,70 @@ def get_token():
         logging.error(f"Auth failed: {e}")
         raise ValueError("Copernicus authentication failed.")
 
-def process_band(href, token, aoi_shape):
-    """Download and clip a single band using rasterio and GDAL vsi."""
-    # Append the authentication header to GDAL via rasterio Env
-    env_kwargs = {
-        "GDAL_HTTP_HEADERS": f"Authorization: Bearer {token}",
-        "GDAL_DISABLE_READDIR_ON_OPEN": "EMPTY_DIR",
-        "CPL_VSIL_CURL_ALLOWED_EXTENSIONS": "tif,jp2"
-    }
-    
-    with rasterio.Env(**env_kwargs):
-        with rasterio.open(href) as src:
-            # Transform AOI to raster CRS if needed
-            # For simplicity in this backend, assuming GeoJSON AOI is WGS84 (EPSG:4326)
-            # and we need to project it to the raster's CRS
-            import geopandas as gpd
-            aoi_gdf = gpd.GeoDataFrame(geometry=[aoi_shape], crs="EPSG:4326")
-            aoi_gdf_proj = aoi_gdf.to_crs(src.crs)
+CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache", "rasters")
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+def get_or_download_band(scene_id, band_name, asset_dict, token):
+    """Check cache, validate, or download via HTTPS to a .part file."""
+    # Find HTTPS alternate URL instead of default S3
+    alternates = asset_dict.get("alternate", {})
+    if "https" in alternates and "href" in alternates["https"]:
+        href = alternates["https"]["href"]
+    else:
+        href = asset_dict.get("href")
+        if href and href.startswith("s3://"):
+            raise ValueError("Sentinel-2 asset download failed: S3 URL returned but no HTTPS alternate available.")
+
+    ext = ".jp2" if ".jp2" in href.lower() else ".tif"
+    cache_path = os.path.join(CACHE_DIR, f"{scene_id}_{band_name}{ext}")
+    part_path = cache_path + ".part"
+
+    # CACHE VALIDATION
+    is_valid = False
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        try:
+            with rasterio.open(cache_path) as src:
+                _ = src.meta
+            is_valid = True
+            logging.info(f"CACHE HIT: {band_name}")
+        except Exception:
+            logging.warning(f"CACHE INVALID: {band_name}")
+            os.remove(cache_path)
+
+    # SAFE DOWNLOAD
+    if not is_valid:
+        logging.info(f"CACHE MISS: downloading {band_name}")
+        
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(href, headers=headers, stream=True)
+        
+        if not resp.ok:
+            raise ValueError(f"Sentinel-2 asset download failed: HTTP {resp.status_code}")
             
-            out_image, out_transform = mask(src, [aoi_gdf_proj.geometry.values[0]], crop=True)
-            return out_image[0], out_transform, src.crs
+        try:
+            with open(part_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            os.rename(part_path, cache_path)
+        except Exception as e:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+            raise e
+            
+    return cache_path
+
+def process_band(scene_id, band_name, asset_dict, token, aoi_shape):
+    """Get the cached local path and clip it using rasterio."""
+    local_path = get_or_download_band(scene_id, band_name, asset_dict, token)
+
+    with rasterio.open(local_path) as src:
+        import geopandas as gpd
+        aoi_gdf = gpd.GeoDataFrame(geometry=[aoi_shape], crs="EPSG:4326")
+        aoi_gdf_proj = aoi_gdf.to_crs(src.crs)
+        
+        out_image, out_transform = mask(src, [aoi_gdf_proj.geometry.values[0]], crop=True)
+        return out_image[0], out_transform, src.crs
 
 @app.post("/api/analyze")
 def analyze_aoi(req: AnalysisRequest):
@@ -119,33 +165,59 @@ def analyze_aoi(req: AnalysisRequest):
     except Exception as e:
         return make_failure("Invalid AOI geometry provided.")
 
-    # Step 2: Query STAC Catalog
+    # Step 2: Query STAC Catalog with Retries and Auth
+    import time
+    
+    # We must get token BEFORE STAC search now
     try:
-        catalog = Client.open(STAC_URL)
-        search = catalog.search(
-            collections=["sentinel-2-l2a"],
-            intersects=geom_dict,
-            max_items=5,
-            query={"eo:cloud_cover": {"lt": 20}}
-        )
-        items = list(search.items())
+        token = get_token()
+    except ValueError as ve:
+        return make_failure(str(ve))
         
-        if not items:
-            return make_failure("No suitable Sentinel-2 scene was found for this AOI and time window.")
-            
-        best_item = items[0]
-    except Exception as e:
-        logging.error(f"STAC search failed: {e}")
-        return make_failure(f"Satellite catalog could not be queried. {str(e)}")
-
+    stac_search_url = STAC_URL.rstrip('/') + '/search'
+    payload = {
+        "collections": ["sentinel-2-l2a"],
+        "intersects": geom_dict,
+        "limit": 3,
+        "query": {"eo:cloud_cover": {"lte": 20}},
+        "sortby": [{"field": "properties.datetime", "direction": "desc"}]
+    }
+    
+    best_item_dict = None
+    
+    for attempt in range(1, 4):
+        logging.info(f"STAC attempt {attempt}")
+        try:
+            stac_resp = requests.post(
+                stac_search_url, 
+                json=payload, 
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                timeout=15
+            )
+            stac_resp.raise_for_status()
+            data = stac_resp.json()
+            features = data.get("features", [])
+            if features:
+                best_item_dict = features[0]
+                break
+        except requests.exceptions.RequestException as e:
+            logging.error(f"STAC search attempt {attempt} failed: {e}")
+            if attempt < 3:
+                time.sleep(2 * attempt)
+            else:
+                return make_failure(f"Satellite catalog could not be queried after 3 attempts. {str(e)}")
+                
+    if not best_item_dict:
+        return make_failure("No suitable Sentinel-2 scene was found for this AOI and time window.")
+        
     # Extract metadata
-    scene_id = best_item.id
-    acq_date = best_item.datetime.isoformat() if best_item.datetime else "Unknown"
-    cloud_cover = best_item.properties.get("eo:cloud_cover", 0)
+    scene_id = best_item_dict.get("id")
+    props = best_item_dict.get("properties", {})
+    acq_date = props.get("datetime", "Unknown")
+    cloud_cover = props.get("eo:cloud_cover", 0)
 
     # Check required assets
-    assets = best_item.assets
-    # Copernicus CDSE S2 L2A STAC has B04_10m and B08_10m
+    assets = best_item_dict.get("assets", {})
     b04_asset = assets.get("B04_10m")
     b08_asset = assets.get("B08_10m")
 
@@ -156,31 +228,33 @@ def analyze_aoi(req: AnalysisRequest):
         "resolution_m": 10,
         "bands": []
     }
+    
+    logging.info(f"selected scene ID: {scene_id}")
+    logging.info(f"acquisition date: {acq_date}")
+    logging.info(f"cloud cover: {cloud_cover}")
+    
+    if b04_asset:
+        alt_href = b04_asset.get("alternate", {}).get("https", {}).get("href")
+        logging.info(f"asset URL type being used: {'HTTPS alternate' if alt_href else 'Default href'}")
 
     if b04_asset and b08_asset:
         metadata["bands"] = ["B04", "B08"]
     else:
-        # We want to return the metadata we found, but fail the computation
         resp = make_failure("Required Sentinel-2 bands are unavailable.")
         resp["metadata_found"] = metadata
         return resp
 
-    # Step 3: Auth
+    # Step 4 & 5: Download (or get from cache) & Clip Rasters
     try:
-        token = get_token()
+        red_arr, transform, crs = process_band(scene_id, "B04", b04_asset, token, aoi_shape)
+        nir_arr, _, _ = process_band(scene_id, "B08", b08_asset, token, aoi_shape)
+        
     except ValueError as ve:
+        # Pass through the specific ValueError from process_band (e.g., HTTP 403, 404, etc.)
+        logging.error(f"Raster retrieval failed: {ve}")
         resp = make_failure(str(ve))
         resp["metadata_found"] = metadata
         return resp
-
-    # Step 4 & 5: Download & Clip Rasters
-    try:
-        b04_href = b04_asset.href
-        b08_href = b08_asset.href
-        
-        red_arr, transform, crs = process_band(b04_href, token, aoi_shape)
-        nir_arr, _, _ = process_band(b08_href, token, aoi_shape)
-        
     except Exception as e:
         logging.error(f"Raster retrieval failed: {e}")
         resp = make_failure("Sentinel-2 raster could not be retrieved.")

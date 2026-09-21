@@ -106,7 +106,7 @@ function App() {
   const [liveDataStatus, setLiveDataStatus] = useState({ backend: 'Checking...', satellite: 'Unknown', raster: 'Unknown' });
 
   useEffect(() => {
-    fetch('/api/health')
+    fetch('http://127.0.0.1:8001/api/health')
       .then(res => res.json())
       .then(data => setLiveDataStatus(data))
       .catch(() => setLiveDataStatus({ backend: 'Unavailable', satellite: 'Unavailable', raster: 'Unavailable' }));
@@ -232,7 +232,7 @@ function App() {
     setAnalysisResult(null);
     setProofOpen(false);
 
-    fetch('/api/analyze', {
+    fetch('http://127.0.0.1:8001/api/analyze', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ aoi: polygonGeoJSON, measurement: type })
