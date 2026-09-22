@@ -186,7 +186,7 @@ def get_or_download_s1_band(scene_id, band_name, asset_dict, token):
     if not is_valid:
         logging.info(f"CACHE MISS: downloading S1 {band_name}")
         headers = {"Authorization": f"Bearer {token}"}
-        resp = requests.get(href, headers=headers, stream=True)
+        resp = requests.get(href, headers=headers, stream=True, timeout=20)
         if not resp.ok:
             raise ValueError(f"Sentinel-1 asset download failed: HTTP {resp.status_code}")
         try:
@@ -221,11 +221,12 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
     s1_vv_mean = 0.0
     s1_valid_pixels = 0
     s1_processing_msg = "Unavailable"
+    s1_reason = "Unknown"
     
     try:
         import time
         t0_s1 = time.time()
-        logging.info("[S1] STAC search")
+        logging.info("[PERF] S1_STAC_START")
         from datetime import datetime, timedelta
         s1_datetime = None
         if acq_date and acq_date != "Unknown":
@@ -247,42 +248,62 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
             s1_payload["datetime"] = s1_datetime
             
         stac_search_url = STAC_URL.rstrip('/') + '/search'
+        logging.info(f"[S1] query URL/collection: {stac_search_url} / sentinel-1-grd")
+        
         s1_resp = requests.post(
             stac_search_url, 
             json=s1_payload, 
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             timeout=10
         )
+        logging.info("[PERF] S1_STAC_END")
         
         s1_asset = None
         if s1_resp.status_code == 200:
             features = s1_resp.json().get("features", [])
+            logging.info(f"[S1] number of matching items: {len(features)}")
             if len(features) > 0:
+                logging.info("[PERF] S1_ASSET_SELECTION")
                 s1_connected = True
                 s1_feature = features[0]
                 s1_scene_id = s1_feature.get("id")
-                logging.info(f"[S1] scene selected: {s1_scene_id}")
+                logging.info(f"[S1] selected scene ID: {s1_scene_id}")
                 s1_assets = s1_feature.get("assets", {})
+                logging.info(f"[S1] available asset keys: {list(s1_assets.keys())}")
                 
                 for p in ["vv", "vh", "hh", "hv"]:
                     if p in s1_assets:
                         s1_pol = p.upper()
                         s1_asset = s1_assets[p]
-                        logging.info(f"[S1] asset selected: {s1_pol}")
+                        logging.info(f"[S1] selected polarization: {s1_pol}")
+                        
+                        href_type = "default"
+                        if "alternate" in s1_asset and "https" in s1_asset["alternate"]:
+                            href_type = "https alternate"
+                        logging.info(f"[S1] selected asset href type: {href_type}")
                         break
                         
-        logging.info(f"[PERF] S1_STAC: {time.time() - t0_s1:.2f}s")
-        
+                if not s1_asset:
+                    s1_reason = "No supported polarization (VV/VH/HH/HV) found in asset keys."
+            else:
+                s1_reason = "No Sentinel-1 GRD products found matching the AOI and timeframe."
+        else:
+            s1_reason = f"STAC API returned HTTP {s1_resp.status_code}"
+            
         if s1_connected and s1_asset:
+            logging.info("[PERF] S1_DOWNLOAD_START")
             t0_dl = time.time()
             s1_path = get_or_download_s1_band(s1_scene_id, s1_pol, s1_asset, token)
-            logging.info(f"[PERF] S1_DOWNLOAD: {time.time() - t0_dl:.2f}s")
+            logging.info("[PERF] S1_DOWNLOAD_END")
+            logging.info(f"[PERF] S1_DOWNLOAD_LATENCY: {time.time() - t0_dl:.2f}s")
             
+            logging.info("[PERF] S1_RASTER_OPEN")
             t0_clip = time.time()
-            logging.info("[S1] raster read")
+            logging.info("[PERF] S1_CLIP")
             s1_arr, _, _ = clip_band(s1_path, aoi_shape)
-            logging.info(f"[PERF] S1_CLIP: {time.time() - t0_clip:.2f}s")
+            logging.info(f"[PERF] S1_CLIP_LATENCY: {time.time() - t0_clip:.2f}s")
             
+            logging.info("[PERF] S1_ANALYSIS")
             t0_ana = time.time()
             s1_arr_float = s1_arr.astype(np.float32)
             valid_mask = s1_arr_float > 0
@@ -292,12 +313,18 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
                 s1_vv_mean = float(np.mean(db_arr))
                 s1_used = True
                 s1_processing_msg = f"{s1_pol} SAR backscatter"
-                logging.info("[S1] analysis complete")
-            logging.info(f"[PERF] S1_ANALYSIS: {time.time() - t0_ana:.2f}s")
+            else:
+                s1_reason = "No valid S1 pixels within the AOI."
+            logging.info(f"[PERF] S1_ANALYSIS_LATENCY: {time.time() - t0_ana:.2f}s")
             
+    except requests.exceptions.Timeout:
+        s1_reason = "Sentinel-1 STAC API or Download timed out."
+        logging.error(f"[S1] exact failure/exception: {s1_reason}")
     except Exception as e:
         import traceback
+        s1_reason = f"Exception: {e}"
         logging.error(f"[ERROR] S1 processing failed: {e}\n{traceback.format_exc()}")
+        logging.error(f"[S1] exact failure/exception: {s1_reason}")
 
     logging.info(f"[PERF] S1_TOTAL: {time.time() - t0_s1:.2f}s")
     logging.info(f"[S1] final response used={str(s1_used).lower()}")
@@ -307,6 +334,8 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
         "sentinel1_used": s1_used,
         "sentinel1_processing": s1_processing_msg
     }
+    if not s1_used:
+        meta["sentinel1_reason"] = s1_reason
     if s1_used:
         meta["sentinel1_polarization"] = s1_pol
         meta["sentinel1_scene_id"] = s1_scene_id
