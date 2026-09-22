@@ -204,10 +204,13 @@ function App() {
       let analysisStr = 'NDVI mean: ' + comp.ndvi_mean + ', Valid pixels: ' + comp.valid_pixels;
       let evidenceSar = meta.sentinel1_used ? meta.sentinel1_processing : 'Unavailable';
       
+      let sarSource = null;
+      let sarProcessing = null;
+      let sarAnalysis = null;
       if (meta.sentinel1_used) {
-          sourceStr += '\nCopernicus Sentinel-1 GRD';
-          processingStr += ', Sentinel-1 ' + meta.sentinel1_polarization + ' SAR backscatter';
-          analysisStr += '\nSentinel-1 ' + meta.sentinel1_polarization + ' mean: ' + meta.sentinel1_vv_mean_db + ' dB, Valid pixels: ' + meta.sentinel1_valid_pixels;
+          sarSource = 'Copernicus Sentinel-1 GRD';
+          sarProcessing = meta.sentinel1_polarization + ' SAR backscatter';
+          sarAnalysis = meta.sentinel1_polarization + ' mean: ' + meta.sentinel1_vv_mean_db + ' dB, Valid pixels: ' + meta.sentinel1_valid_pixels;
       }
 
       const result = {
@@ -229,6 +232,9 @@ function App() {
             source: sourceStr,
             processing: processingStr,
             analysis: analysisStr,
+            sar_source: sarSource,
+            sar_processing: sarProcessing,
+            sar_analysis: sarAnalysis,
             decision: data.status,
             output: 'GeoJSON polygons generated via NDVI threshold >= 0.4'
         },
@@ -617,15 +623,26 @@ function App() {
                   ))}
                 </div>
 
-                <div className="proof-drawer">
+                  <div className="proof-drawer">
                   <button className="proof-btn" onClick={() => setProofOpen(!proofOpen)}>
                     {proofOpen ? '▼' : '▶'} How was this determined? (Technical Proof)
                   </button>
                   {proofOpen && (
-                    <div className="proof-content">
+                    <div className="proof-content" style={{whiteSpace: 'pre-wrap'}}>
                       <div className="proof-row"><span>Source:</span> {analysisResult.technicalProof.source}</div>
                       <div className="proof-row"><span>Processing:</span> {analysisResult.technicalProof.processing}</div>
                       <div className="proof-row"><span>Analysis:</span> {analysisResult.technicalProof.analysis}</div>
+                      
+                      {analysisResult.technicalProof.sar_source && (
+                        <>
+                          <br/>
+                          <div className="proof-row"><span>Supporting Evidence:</span> {analysisResult.technicalProof.sar_source}</div>
+                          <div className="proof-row"><span>Processing:</span> {analysisResult.technicalProof.sar_processing}</div>
+                          <div className="proof-row"><span>Analysis:</span> {analysisResult.technicalProof.sar_analysis}</div>
+                        </>
+                      )}
+                      
+                      <br/>
                       <div className="proof-row"><span>Decision:</span> {analysisResult.technicalProof.decision}</div>
                       <div className="proof-row"><span>Output:</span> {analysisResult.technicalProof.output}</div>
                     </div>

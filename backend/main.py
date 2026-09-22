@@ -240,6 +240,122 @@ def analyze_aoi(req: AnalysisRequest):
     t_auth = time.time() - t0
     logging.info(f"[PERF] AUTH: {t_auth:.2f}s")
         
+def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
+    s1_connected = False
+    s1_used = False
+    s1_scene_id = None
+    s1_pol = None
+    s1_vv_mean = 0.0
+    s1_valid_pixels = 0
+    s1_processing_msg = "Unavailable"
+    
+    try:
+        t0_s1 = time.time()
+        logging.info("[S1] STAC search")
+        from datetime import datetime, timedelta
+        s1_datetime = None
+        if acq_date and acq_date != "Unknown":
+            try:
+                s2_dt = datetime.strptime(acq_date[:10], "%Y-%m-%d")
+                dt_start = (s2_dt - timedelta(days=15)).strftime("%Y-%m-%dT00:00:00Z")
+                dt_end = (s2_dt + timedelta(days=15)).strftime("%Y-%m-%dT23:59:59Z")
+                s1_datetime = f"{dt_start}/{dt_end}"
+            except Exception:
+                pass
+                
+        s1_payload = {
+            "collections": ["sentinel-1-grd"],
+            "intersects": geom_dict,
+            "limit": 1,
+            "sortby": [{"field": "properties.datetime", "direction": "desc"}]
+        }
+        if s1_datetime:
+            s1_payload["datetime"] = s1_datetime
+            
+        stac_search_url = STAC_URL.rstrip('/') + '/search'
+        s1_resp = requests.post(
+            stac_search_url, 
+            json=s1_payload, 
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=10
+        )
+        
+        s1_asset = None
+        if s1_resp.status_code == 200:
+            features = s1_resp.json().get("features", [])
+            if len(features) > 0:
+                s1_connected = True
+                s1_feature = features[0]
+                s1_scene_id = s1_feature.get("id")
+                logging.info(f"[S1] scene selected: {s1_scene_id}")
+                s1_assets = s1_feature.get("assets", {})
+                
+                for p in ["vv", "vh", "hh", "hv"]:
+                    if p in s1_assets:
+                        s1_pol = p.upper()
+                        s1_asset = s1_assets[p]
+                        logging.info(f"[S1] asset selected: {s1_pol}")
+                        break
+                        
+        logging.info(f"[PERF] S1_STAC: {time.time() - t0_s1:.2f}s")
+        
+        if s1_connected and s1_asset:
+            t0_dl = time.time()
+            s1_path = get_or_download_s1_band(s1_scene_id, s1_pol, s1_asset, token)
+            logging.info(f"[PERF] S1_DOWNLOAD: {time.time() - t0_dl:.2f}s")
+            
+            t0_clip = time.time()
+            logging.info("[S1] raster read")
+            s1_arr, _, _ = clip_band(s1_path, aoi_shape)
+            logging.info(f"[PERF] S1_CLIP: {time.time() - t0_clip:.2f}s")
+            
+            t0_ana = time.time()
+            s1_arr_float = s1_arr.astype(np.float32)
+            valid_mask = s1_arr_float > 0
+            s1_valid_pixels = int(np.sum(valid_mask))
+            if s1_valid_pixels > 0:
+                db_arr = 20 * np.log10(s1_arr_float[valid_mask] + 1e-10)
+                s1_vv_mean = float(np.mean(db_arr))
+                s1_used = True
+                s1_processing_msg = f"{s1_pol} SAR backscatter"
+                logging.info("[S1] analysis complete")
+            logging.info(f"[PERF] S1_ANALYSIS: {time.time() - t0_ana:.2f}s")
+            
+    except Exception as e:
+        logging.error(f"Sentinel-1 connectivity/processing failed: {e}")
+
+    logging.info(f"[S1] final response used={str(s1_used).lower()}")
+    
+    meta = {
+        "sentinel1_connected": s1_connected,
+        "sentinel1_used": s1_used,
+        "sentinel1_processing": s1_processing_msg
+    }
+    if s1_used:
+        meta["sentinel1_polarization"] = s1_pol
+        meta["sentinel1_scene_id"] = s1_scene_id
+        meta["sentinel1_vv_mean_db"] = round(s1_vv_mean, 2)
+        meta["sentinel1_valid_pixels"] = s1_valid_pixels
+        
+    return meta
+
+@app.post("/api/analyze")
+def analyze_aoi(req: AnalysisRequest):
+    t0_total = time.time()
+    try:
+        geom_dict = req.aoi["features"][0]["geometry"] if "features" in req.aoi else req.aoi["geometry"]
+        aoi_shape = shape(geom_dict)
+    except Exception as e:
+        return make_failure("Invalid AOI geometry provided.")
+
+    t0 = time.time()
+    try:
+        token = get_token()
+    except ValueError as ve:
+        return make_failure(str(ve))
+    t_auth = time.time() - t0
+    logging.info(f"[PERF] AUTH: {t_auth:.2f}s")
+        
     t0 = time.time()
     best_item_dict = None
     stac_search_url = STAC_URL.rstrip('/') + '/search'
@@ -298,103 +414,42 @@ def analyze_aoi(req: AnalysisRequest):
     b04_asset = assets.get("B04_10m")
     b08_asset = assets.get("B08_10m")
 
-    # Check Sentinel-1 Connectivity and Process SAR
-    s1_connected = False
-    s1_used = False
-    s1_scene_id = None
-    s1_pol = None
-    s1_vv_mean = 0.0
-    s1_valid_pixels = 0
-    s1_processing_msg = "Unavailable"
-    
-    try:
-        t0_s1 = time.time()
-        from datetime import datetime, timedelta
-        s1_datetime = None
-        if acq_date and acq_date != "Unknown":
-            try:
-                s2_dt = datetime.strptime(acq_date[:10], "%Y-%m-%d")
-                dt_start = (s2_dt - timedelta(days=15)).strftime("%Y-%m-%dT00:00:00Z")
-                dt_end = (s2_dt + timedelta(days=15)).strftime("%Y-%m-%dT23:59:59Z")
-                s1_datetime = f"{dt_start}/{dt_end}"
-            except Exception:
-                pass
-                
-        s1_payload = {
-            "collections": ["sentinel-1-grd"],
-            "intersects": geom_dict,
-            "limit": 1,
-            "sortby": [{"field": "properties.datetime", "direction": "desc"}]
-        }
-        if s1_datetime:
-            s1_payload["datetime"] = s1_datetime
-            
-        s1_resp = requests.post(
-            stac_search_url, 
-            json=s1_payload, 
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            timeout=10
-        )
+    logging.info(f"selected scene ID: {scene_id}")
+    logging.info(f"acquisition date: {acq_date}")
+    logging.info(f"cloud cover: {cloud_cover}")
+
+    # Launch parallel downloads and Sentinel-1 processing
+    import concurrent.futures
+    s1_meta = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        s1_future = executor.submit(process_sentinel1, token, geom_dict, acq_date, aoi_shape)
+        b04_future = None
+        b08_future = None
         
-        s1_asset = None
-        if s1_resp.status_code == 200:
-            features = s1_resp.json().get("features", [])
-            if len(features) > 0:
-                s1_connected = True
-                s1_feature = features[0]
-                s1_scene_id = s1_feature.get("id")
-                s1_assets = s1_feature.get("assets", {})
-                if "vv" in s1_assets:
-                    s1_pol = "VV"
-                    s1_asset = s1_assets["vv"]
-                elif "vh" in s1_assets:
-                    s1_pol = "VH"
-                    s1_asset = s1_assets["vh"]
-        logging.info(f"[PERF] S1_STAC: {time.time() - t0_s1:.2f}s")
-        
-        if s1_connected and s1_asset:
-            t0_dl = time.time()
-            s1_path = get_or_download_s1_band(s1_scene_id, s1_pol, s1_asset, token)
-            logging.info(f"[PERF] S1_DOWNLOAD: {time.time() - t0_dl:.2f}s")
+        if b04_asset:
+            b04_future = executor.submit(get_or_download_band, scene_id, "B04_10m", b04_asset, token)
+        if b08_asset:
+            b08_future = executor.submit(get_or_download_band, scene_id, "B08_10m", b08_asset, token)
             
-            t0_clip = time.time()
-            s1_arr, _, _ = clip_band(s1_path, aoi_shape)
-            logging.info(f"[PERF] S1_CLIP: {time.time() - t0_clip:.2f}s")
-            
-            t0_ana = time.time()
-            s1_arr_float = s1_arr.astype(np.float32)
-            valid_mask = s1_arr_float > 0
-            s1_valid_pixels = int(np.sum(valid_mask))
-            if s1_valid_pixels > 0:
-                # Basic conversion to dB for GRD amplitude
-                db_arr = 20 * np.log10(s1_arr_float[valid_mask] + 1e-10)
-                s1_vv_mean = float(np.mean(db_arr))
-                s1_used = True
-                s1_processing_msg = f"{s1_pol} SAR backscatter"
-            logging.info(f"[PERF] S1_ANALYSIS: {time.time() - t0_ana:.2f}s")
-            
-    except Exception as e:
-        logging.error(f"Sentinel-1 connectivity/processing failed: {e}")
+        s1_meta = s1_future.result()
+        try:
+            t_s2_dl0 = time.time()
+            b04_path = b04_future.result() if b04_future else None
+            logging.info(f"[PERF] B04: {time.time() - t_s2_dl0:.2f}s (parallel wait)")
+            t_s2_dl1 = time.time()
+            b08_path = b08_future.result() if b08_future else None
+            logging.info(f"[PERF] B08: {time.time() - t_s2_dl1:.2f}s (parallel wait)")
+        except Exception as e:
+            return make_failure(f"Failed to retrieve Sentinel-2 data: {e}")
 
     metadata = {
         "scene_id": scene_id,
         "acquisition_date": acq_date,
         "cloud_cover": cloud_cover,
         "resolution_m": 10,
-        "bands": [],
-        "sentinel1_connected": s1_connected,
-        "sentinel1_used": s1_used,
-        "sentinel1_processing": s1_processing_msg
+        "bands": []
     }
-    if s1_used:
-        metadata["sentinel1_polarization"] = s1_pol
-        metadata["sentinel1_scene_id"] = s1_scene_id
-        metadata["sentinel1_vv_mean_db"] = round(s1_vv_mean, 2)
-        metadata["sentinel1_valid_pixels"] = s1_valid_pixels
-    
-    logging.info(f"selected scene ID: {scene_id}")
-    logging.info(f"acquisition date: {acq_date}")
-    logging.info(f"cloud cover: {cloud_cover}")
+    metadata.update(s1_meta)
     
     if b04_asset:
         alt_href = b04_asset.get("alternate", {}).get("https", {}).get("href")
@@ -407,18 +462,8 @@ def analyze_aoi(req: AnalysisRequest):
         resp["metadata_found"] = metadata
         return resp
 
-    # Step 4 & 5: Download (or get from cache) & Clip Rasters
+    # Step 4 & 5: Clip Rasters (Downloads handled concurrently above)
     try:
-        t0 = time.time()
-        b04_path = get_or_download_band(scene_id, "B04", b04_asset, token)
-        t_b04 = time.time() - t0
-        logging.info(f"[PERF] B04: {t_b04:.2f}s")
-        
-        t0 = time.time()
-        b08_path = get_or_download_band(scene_id, "B08", b08_asset, token)
-        t_b08 = time.time() - t0
-        logging.info(f"[PERF] B08: {t_b08:.2f}s")
-        
         t0 = time.time()
         red_arr, transform, crs = clip_band(b04_path, aoi_shape)
         nir_arr, _, _ = clip_band(b08_path, aoi_shape)
