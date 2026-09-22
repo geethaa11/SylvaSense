@@ -100,53 +100,59 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 def get_or_download_band(scene_id, band_name, asset_dict, token):
     """Check cache, validate, or download via HTTPS to a .part file."""
-    # Find HTTPS alternate URL instead of default S3
-    alternates = asset_dict.get("alternate", {})
-    if "https" in alternates and "href" in alternates["https"]:
-        href = alternates["https"]["href"]
-    else:
-        href = asset_dict.get("href")
-        if href and href.startswith("s3://"):
-            raise ValueError("Sentinel-2 asset download failed: S3 URL returned but no HTTPS alternate available.")
+    try:
+        # Find HTTPS alternate URL instead of default S3
+        alternates = asset_dict.get("alternate", {})
+        if "https" in alternates and "href" in alternates["https"]:
+            href = alternates["https"]["href"]
+        else:
+            href = asset_dict.get("href")
+            if href and href.startswith("s3://"):
+                raise ValueError("Sentinel-2 asset download failed: S3 URL returned but no HTTPS alternate available.")
 
-    ext = ".jp2" if ".jp2" in href.lower() else ".tif"
-    cache_path = os.path.join(CACHE_DIR, f"{scene_id}_{band_name}{ext}")
-    part_path = cache_path + ".part"
+        ext = ".jp2" if ".jp2" in href.lower() else ".tif"
+        cache_path = os.path.join(CACHE_DIR, f"{scene_id}_{band_name}{ext}")
+        part_path = cache_path + ".part"
 
-    # CACHE VALIDATION
-    is_valid = False
-    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
-        try:
-            with rasterio.open(cache_path) as src:
-                _ = src.meta
-            is_valid = True
-            logging.info(f"CACHE HIT: {band_name}")
-        except Exception:
-            logging.warning(f"CACHE INVALID: {band_name}")
-            os.remove(cache_path)
+        # CACHE VALIDATION
+        is_valid = False
+        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+            try:
+                with rasterio.Env():
+                    with rasterio.open(cache_path) as src:
+                        _ = src.meta
+                is_valid = True
+                logging.info(f"CACHE HIT: {band_name}")
+            except Exception:
+                logging.warning(f"CACHE INVALID: {band_name}")
+                os.remove(cache_path)
 
-    # SAFE DOWNLOAD
-    if not is_valid:
-        logging.info(f"CACHE MISS: downloading {band_name}")
-        
-        headers = {"Authorization": f"Bearer {token}"}
-        resp = requests.get(href, headers=headers, stream=True)
-        
-        if not resp.ok:
-            raise ValueError(f"Sentinel-2 asset download failed: HTTP {resp.status_code}")
+        # SAFE DOWNLOAD
+        if not is_valid:
+            logging.info(f"CACHE MISS: downloading {band_name}")
             
-        try:
-            with open(part_path, "wb") as f:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-            os.rename(part_path, cache_path)
-        except Exception as e:
-            if os.path.exists(part_path):
-                os.remove(part_path)
-            raise e
+            headers = {"Authorization": f"Bearer {token}"}
+            resp = requests.get(href, headers=headers, stream=True)
             
-    return cache_path
+            if not resp.ok:
+                raise ValueError(f"Sentinel-2 asset download failed: HTTP {resp.status_code}")
+                
+            try:
+                with open(part_path, "wb") as f:
+                    for chunk in resp.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                os.rename(part_path, cache_path)
+            except Exception as e:
+                if os.path.exists(part_path):
+                    os.remove(part_path)
+                raise e
+                
+        return cache_path
+    except Exception as e:
+        import traceback
+        logging.error(f"[ERROR] S2 {band_name} processing failed: {e}\n{traceback.format_exc()}")
+        raise e
 
 S1_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache", "rasters", "sentinel1")
 os.makedirs(S1_CACHE_DIR, exist_ok=True)
@@ -167,8 +173,9 @@ def get_or_download_s1_band(scene_id, band_name, asset_dict, token):
     is_valid = False
     if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
         try:
-            with rasterio.open(cache_path) as src:
-                _ = src.meta
+            with rasterio.Env():
+                with rasterio.open(cache_path) as src:
+                    _ = src.meta
             is_valid = True
             logging.info(f"CACHE HIT: S1 {band_name}")
         except Exception:
@@ -196,13 +203,14 @@ def get_or_download_s1_band(scene_id, band_name, asset_dict, token):
 
 def clip_band(local_path, aoi_shape):
     """Clip a local raster using rasterio mask."""
-    with rasterio.open(local_path) as src:
-        import geopandas as gpd
-        aoi_gdf = gpd.GeoDataFrame(geometry=[aoi_shape], crs="EPSG:4326")
-        aoi_gdf_proj = aoi_gdf.to_crs(src.crs)
-        
-        out_image, out_transform = mask(src, [aoi_gdf_proj.geometry.values[0]], crop=True)
-        return out_image[0], out_transform, src.crs
+    with rasterio.Env():
+        with rasterio.open(local_path) as src:
+            import geopandas as gpd
+            aoi_gdf = gpd.GeoDataFrame(geometry=[aoi_shape], crs="EPSG:4326")
+            aoi_gdf_proj = aoi_gdf.to_crs(src.crs)
+            
+            out_image, out_transform = mask(src, [aoi_gdf_proj.geometry.values[0]], crop=True)
+            return out_image[0], out_transform, src.crs
 
 @app.post("/api/analyze")
 def analyze_aoi(req: AnalysisRequest):
@@ -322,8 +330,10 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
             logging.info(f"[PERF] S1_ANALYSIS: {time.time() - t0_ana:.2f}s")
             
     except Exception as e:
-        logging.error(f"Sentinel-1 connectivity/processing failed: {e}")
+        import traceback
+        logging.error(f"[ERROR] S1 processing failed: {e}\n{traceback.format_exc()}")
 
+    logging.info(f"[PERF] S1_TOTAL: {time.time() - t0_s1:.2f}s")
     logging.info(f"[S1] final response used={str(s1_used).lower()}")
     
     meta = {
@@ -418,6 +428,14 @@ def analyze_aoi(req: AnalysisRequest):
     logging.info(f"acquisition date: {acq_date}")
     logging.info(f"cloud cover: {cloud_cover}")
 
+    metadata = {
+        "scene_id": scene_id,
+        "acquisition_date": acq_date,
+        "cloud_cover": cloud_cover,
+        "resolution_m": 10,
+        "bands": []
+    }
+
     # Launch parallel downloads and Sentinel-1 processing
     import concurrent.futures
     s1_meta = {}
@@ -432,25 +450,21 @@ def analyze_aoi(req: AnalysisRequest):
             b08_future = executor.submit(get_or_download_band, scene_id, "B08_10m", b08_asset, token)
             
         s1_meta = s1_future.result()
+        metadata.update(s1_meta)
         try:
             t_s2_dl0 = time.time()
             b04_path = b04_future.result() if b04_future else None
-            logging.info(f"[PERF] B04: {time.time() - t_s2_dl0:.2f}s (parallel wait)")
+            logging.info(f"[PERF] S2_B04: {time.time() - t_s2_dl0:.2f}s (parallel wait)")
             t_s2_dl1 = time.time()
             b08_path = b08_future.result() if b08_future else None
-            logging.info(f"[PERF] B08: {time.time() - t_s2_dl1:.2f}s (parallel wait)")
+            logging.info(f"[PERF] S2_B08: {time.time() - t_s2_dl1:.2f}s (parallel wait)")
         except Exception as e:
-            return make_failure(f"Failed to retrieve Sentinel-2 data: {e}")
+            import traceback
+            logging.error(f"[ERROR] ANALYZE failed: {e}\n{traceback.format_exc()}")
+            resp = make_failure(f"Failed to retrieve Sentinel-2 data: {e}")
+            resp["metadata_found"] = metadata
+            return resp
 
-    metadata = {
-        "scene_id": scene_id,
-        "acquisition_date": acq_date,
-        "cloud_cover": cloud_cover,
-        "resolution_m": 10,
-        "bands": []
-    }
-    metadata.update(s1_meta)
-    
     if b04_asset:
         alt_href = b04_asset.get("alternate", {}).get("https", {}).get("href")
         logging.info(f"asset URL type being used: {'HTTPS alternate' if alt_href else 'Default href'}")
@@ -555,7 +569,7 @@ def analyze_aoi(req: AnalysisRequest):
         t_poly = time.time() - t0
         logging.info(f"[PERF] POLYGONIZE: {t_poly:.2f}s")
 
-        t_total = time.time() - t_start
+        t_total = time.time() - t0_total
         logging.info(f"[PERF] TOTAL: {t_total:.2f}s")
 
         # Step 9: Final Response Structure
