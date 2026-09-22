@@ -254,22 +254,48 @@ def analyze_aoi(req: AnalysisRequest):
     # Check Sentinel-1 Connectivity
     s1_connected = False
     try:
+        from datetime import datetime, timedelta
+        s1_datetime = None
+        if acq_date and acq_date != "Unknown":
+            try:
+                s2_dt = datetime.strptime(acq_date[:10], "%Y-%m-%d")
+                dt_start = (s2_dt - timedelta(days=15)).strftime("%Y-%m-%dT00:00:00Z")
+                dt_end = (s2_dt + timedelta(days=15)).strftime("%Y-%m-%dT23:59:59Z")
+                s1_datetime = f"{dt_start}/{dt_end}"
+            except Exception:
+                pass
+                
         s1_payload = {
             "collections": ["sentinel-1-grd"],
             "intersects": geom_dict,
             "limit": 1,
             "sortby": [{"field": "properties.datetime", "direction": "desc"}]
         }
+        if s1_datetime:
+            s1_payload["datetime"] = s1_datetime
+
+        logging.info(f"Sentinel-1 check - AOI bounding box: {geom_dict}")
+        logging.info(f"Sentinel-1 check - STAC endpoint: {stac_search_url}")
+        logging.info(f"Sentinel-1 check - collection being queried: {s1_payload['collections']}")
+        logging.info(f"Sentinel-1 check - datetime range: {s1_datetime or '(no explicit range)'}")
+        
         s1_resp = requests.post(
             stac_search_url, 
             json=s1_payload, 
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            timeout=5
+            timeout=10
         )
-        if s1_resp.status_code == 200 and len(s1_resp.json().get("features", [])) > 0:
-            s1_connected = True
+        
+        logging.info(f"Sentinel-1 check - HTTP status code: {s1_resp.status_code}")
+        if s1_resp.status_code == 200:
+            features = s1_resp.json().get("features", [])
+            logging.info(f"Sentinel-1 check - number of Sentinel-1 results returned: {len(features)}")
+            if len(features) > 0:
+                s1_connected = True
+        else:
+            logging.error(f"Sentinel-1 check - response error/message: {s1_resp.text}")
     except Exception as e:
-        logging.warning(f"Sentinel-1 connectivity check failed: {e}")
+        logging.error(f"Sentinel-1 connectivity check failed: {e}")
 
     metadata = {
         "scene_id": scene_id,
