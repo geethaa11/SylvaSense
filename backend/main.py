@@ -43,6 +43,9 @@ class AnalysisRequest(BaseModel):
     aoi: dict
     measurement: str
 
+AUTH_CACHE = {"token": None, "expires_at": 0}
+STAC_CACHE = {"best_item_dict": None, "expires_at": 0}
+
 @app.get("/api/health")
 def health_check():
     # Test catalog connection
@@ -61,6 +64,11 @@ def health_check():
 
 def get_token():
     """Retrieve OAuth token for Copernicus Data Space Ecosystem."""
+    import time
+    if AUTH_CACHE["token"] and time.time() < AUTH_CACHE["expires_at"]:
+        logging.info("Reusing cached Copernicus authentication token.")
+        return AUTH_CACHE["token"]
+
     if not USERNAME or not PASSWORD:
         raise ValueError("Copernicus authentication credentials are not configured.")
     
@@ -75,7 +83,12 @@ def get_token():
     try:
         resp = requests.post(url, data=data, timeout=10)
         resp.raise_for_status()
-        return resp.json()["access_token"]
+        js = resp.json()
+        token = js["access_token"]
+        expires_in = js.get("expires_in", 600)
+        AUTH_CACHE["token"] = token
+        AUTH_CACHE["expires_at"] = time.time() + expires_in - 60
+        return token
     except Exception as e:
         logging.error(f"Auth failed: {e}")
         raise ValueError("Copernicus authentication failed.")
@@ -133,10 +146,8 @@ def get_or_download_band(scene_id, band_name, asset_dict, token):
             
     return cache_path
 
-def process_band(scene_id, band_name, asset_dict, token, aoi_shape):
-    """Get the cached local path and clip it using rasterio."""
-    local_path = get_or_download_band(scene_id, band_name, asset_dict, token)
-
+def clip_band(local_path, aoi_shape):
+    """Clip a local raster using rasterio mask."""
     with rasterio.open(local_path) as src:
         import geopandas as gpd
         aoi_gdf = gpd.GeoDataFrame(geometry=[aoi_shape], crs="EPSG:4326")
@@ -171,48 +182,61 @@ def analyze_aoi(req: AnalysisRequest):
 
     # Step 2: Query STAC Catalog with Retries and Auth
     import time
+    t_start = time.time()
     
-    # We must get token BEFORE STAC search now
+    t0 = time.time()
     try:
         token = get_token()
     except ValueError as ve:
         return make_failure(str(ve))
+    t_auth = time.time() - t0
+    logging.info(f"[PERF] AUTH: {t_auth:.2f}s")
         
-    stac_search_url = STAC_URL.rstrip('/') + '/search'
-    payload = {
-        "collections": ["sentinel-2-l2a"],
-        "intersects": geom_dict,
-        "limit": 3,
-        "query": {"eo:cloud_cover": {"lte": 20}},
-        "sortby": [{"field": "properties.datetime", "direction": "desc"}]
-    }
-    
+    t0 = time.time()
     best_item_dict = None
-    
-    for attempt in range(1, 4):
-        logging.info(f"STAC attempt {attempt}")
-        try:
-            stac_resp = requests.post(
-                stac_search_url, 
-                json=payload, 
-                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-                timeout=15
-            )
-            stac_resp.raise_for_status()
-            data = stac_resp.json()
-            features = data.get("features", [])
-            if features:
-                best_item_dict = features[0]
-                break
-        except requests.exceptions.RequestException as e:
-            logging.error(f"STAC search attempt {attempt} failed: {e}")
-            if attempt < 3:
-                time.sleep(2 * attempt)
-            else:
-                return make_failure(f"Satellite catalog could not be queried after 3 attempts. {str(e)}")
-                
-    if not best_item_dict:
-        return make_failure("No suitable Sentinel-2 scene was found for this AOI and time window.")
+    if STAC_CACHE["best_item_dict"] and time.time() < STAC_CACHE["expires_at"]:
+        best_item_dict = STAC_CACHE["best_item_dict"]
+        logging.info("[SCENE CACHE HIT]")
+    else:
+        logging.info("[SCENE CACHE MISS]")
+        stac_search_url = STAC_URL.rstrip('/') + '/search'
+        payload = {
+            "collections": ["sentinel-2-l2a"],
+            "intersects": geom_dict,
+            "limit": 3,
+            "query": {"eo:cloud_cover": {"lte": 20}},
+            "sortby": [{"field": "properties.datetime", "direction": "desc"}]
+        }
+        
+        for attempt in range(1, 4):
+            logging.info(f"STAC attempt {attempt}")
+            try:
+                stac_resp = requests.post(
+                    stac_search_url, 
+                    json=payload, 
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    timeout=15
+                )
+                stac_resp.raise_for_status()
+                data = stac_resp.json()
+                features = data.get("features", [])
+                if features:
+                    best_item_dict = features[0]
+                    STAC_CACHE["best_item_dict"] = best_item_dict
+                    STAC_CACHE["expires_at"] = time.time() + 600
+                    break
+            except requests.exceptions.RequestException as e:
+                logging.error(f"STAC search attempt {attempt} failed: {e}")
+                if attempt < 3:
+                    time.sleep(2 * attempt)
+                else:
+                    return make_failure(f"Satellite catalog could not be queried after 3 attempts. {str(e)}")
+                    
+        if not best_item_dict:
+            return make_failure("No suitable Sentinel-2 scene was found for this AOI and time window.")
+            
+    t_stac = time.time() - t0
+    logging.info(f"[PERF] STAC: {t_stac:.2f}s")
         
     # Extract metadata
     scene_id = best_item_dict.get("id")
@@ -250,11 +274,24 @@ def analyze_aoi(req: AnalysisRequest):
 
     # Step 4 & 5: Download (or get from cache) & Clip Rasters
     try:
-        red_arr, transform, crs = process_band(scene_id, "B04", b04_asset, token, aoi_shape)
-        nir_arr, _, _ = process_band(scene_id, "B08", b08_asset, token, aoi_shape)
+        t0 = time.time()
+        b04_path = get_or_download_band(scene_id, "B04", b04_asset, token)
+        t_b04 = time.time() - t0
+        logging.info(f"[PERF] B04: {t_b04:.2f}s")
+        
+        t0 = time.time()
+        b08_path = get_or_download_band(scene_id, "B08", b08_asset, token)
+        t_b08 = time.time() - t0
+        logging.info(f"[PERF] B08: {t_b08:.2f}s")
+        
+        t0 = time.time()
+        red_arr, transform, crs = clip_band(b04_path, aoi_shape)
+        nir_arr, _, _ = clip_band(b08_path, aoi_shape)
+        t_clip = time.time() - t0
+        logging.info(f"[PERF] CLIP: {t_clip:.2f}s")
         
     except ValueError as ve:
-        # Pass through the specific ValueError from process_band (e.g., HTTP 403, 404, etc.)
+        # Pass through the specific ValueError (e.g., HTTP 403, 404, etc.)
         logging.error(f"Raster retrieval failed: {ve}")
         resp = make_failure(str(ve))
         resp["metadata_found"] = metadata
@@ -267,6 +304,7 @@ def analyze_aoi(req: AnalysisRequest):
 
     # Step 6: Real NDVI Calculation
     try:
+        t0 = time.time()
         # Convert to float for math
         red = red_arr.astype(np.float32)
         nir = nir_arr.astype(np.float32)
@@ -293,8 +331,12 @@ def analyze_aoi(req: AnalysisRequest):
         canopy_mask = (ndvi >= NDVI_THRESHOLD) & valid_mask
         canopy_pixels = int(np.sum(canopy_mask))
         canopy_cover_percent = (canopy_pixels / valid_pixels) * 100.0
+        
+        t_ndvi = time.time() - t0
+        logging.info(f"[PERF] NDVI: {t_ndvi:.2f}s")
 
         # Step 8: Canopy Objects & GeoJSON
+        t0 = time.time()
         # Generate polygon geometries from the binary mask
         import geopandas as gpd
         mask_uint8 = canopy_mask.astype(np.uint8)
@@ -329,6 +371,12 @@ def analyze_aoi(req: AnalysisRequest):
             geojson_dict = json.loads(gdf_wgs84.to_json())
         else:
             geojson_dict = {"type": "FeatureCollection", "features": []}
+            
+        t_poly = time.time() - t0
+        logging.info(f"[PERF] POLYGONIZE: {t_poly:.2f}s")
+
+        t_total = time.time() - t_start
+        logging.info(f"[PERF] TOTAL: {t_total:.2f}s")
 
         # Step 9: Final Response Structure
         return {
