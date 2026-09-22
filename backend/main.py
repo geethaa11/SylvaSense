@@ -2,6 +2,7 @@ import os
 from dotenv import load_dotenv
 import json
 import logging
+import time
 import numpy as np
 load_dotenv()
 import rasterio
