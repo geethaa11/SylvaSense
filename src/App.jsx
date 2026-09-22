@@ -199,30 +199,41 @@ function App() {
       setActiveLayers(p => ({ ...p, objects: true }));
     }
 
-    const result = {
-      id: type,
-      title: type,
-      requested: type === 'ENUMERATION' ? 'Individual tree enumeration' : type === 'STRUCTURE' ? 'Canopy cover / structure' : type === 'BIOMASS' ? 'Stand-level AGB estimation' : 'Disturbance / Change',
-      required: [
-          { name: 'Live API Connection', status: 'SUPPORTED' },
-          { name: 'Sentinel-2 Raster Data', status: 'SUPPORTED' }
-      ],
-      decision: data.status,
-      supportedResolution: data.resolution ? data.resolution.supported : 'L3',
-      ladderLevel: data.resolution ? data.resolution.supported : 'L3',
-      reason: data.resolution ? data.resolution.reason : 'Successfully processed raster.',
-      resultTitle: type === 'ENUMERATION' ? (comp.canopy_objects + ' Canopy Objects') : (comp.canopy_cover_percent + '% Canopy Cover'),
-      resultSub: 'Calculated from LIVE raster extraction',
-      evidenceUsed: 'Sentinel-2 ' + meta.scene_id,
-      technicalProof: {
-          source: 'Copernicus Sentinel-2 (' + meta.acquisition_date + ')',
-          processing: 'FastAPI + Rasterio',
-          analysis: 'NDVI mean: ' + comp.ndvi_mean + ', Valid pixels: ' + comp.valid_pixels,
-          decision: data.status,
-          output: 'GeoJSON polygons generated via NDVI threshold >= 0.4'
-      },
-      validationZones: [],
-      evidenceProfile: { optical: 'B04, B08 processed', sar: 'Unavailable', canopy: 'NDVI segmented', temporal: 'Single scene' },
+      let sourceStr = 'Copernicus Sentinel-2 (' + meta.acquisition_date + ')';
+      let processingStr = 'FastAPI + Rasterio, Sentinel-2 NDVI';
+      let analysisStr = 'NDVI mean: ' + comp.ndvi_mean + ', Valid pixels: ' + comp.valid_pixels;
+      let evidenceSar = meta.sentinel1_used ? meta.sentinel1_processing : 'Unavailable';
+      
+      if (meta.sentinel1_used) {
+          sourceStr += '\nCopernicus Sentinel-1 GRD';
+          processingStr += ', Sentinel-1 ' + meta.sentinel1_polarization + ' SAR backscatter';
+          analysisStr += '\nSentinel-1 ' + meta.sentinel1_polarization + ' mean: ' + meta.sentinel1_vv_mean_db + ' dB, Valid pixels: ' + meta.sentinel1_valid_pixels;
+      }
+
+      const result = {
+        id: type,
+        title: type,
+        requested: type === 'ENUMERATION' ? 'Individual tree enumeration' : type === 'STRUCTURE' ? 'Canopy cover / structure' : type === 'BIOMASS' ? 'Stand-level AGB estimation' : 'Disturbance / Change',
+        required: [
+            { name: 'Live API Connection', status: 'SUPPORTED' },
+            { name: 'Sentinel-2 Raster Data', status: 'SUPPORTED' }
+        ],
+        decision: data.status,
+        supportedResolution: data.resolution ? data.resolution.supported : 'L3',
+        ladderLevel: data.resolution ? data.resolution.supported : 'L3',
+        reason: data.resolution ? data.resolution.reason : 'Successfully processed raster.',
+        resultTitle: type === 'ENUMERATION' ? (comp.canopy_objects + ' Canopy Objects') : (comp.canopy_cover_percent + '% Canopy Cover'),
+        resultSub: 'Calculated from LIVE raster extraction',
+        evidenceUsed: 'Sentinel-2 ' + meta.scene_id,
+        technicalProof: {
+            source: sourceStr,
+            processing: processingStr,
+            analysis: analysisStr,
+            decision: data.status,
+            output: 'GeoJSON polygons generated via NDVI threshold >= 0.4'
+        },
+        validationZones: [],
+        evidenceProfile: { optical: 'B04, B08 processed', sar: evidenceSar, canopy: 'NDVI segmented', temporal: 'Single scene' },
       showAgbPipeline: false
     };
     

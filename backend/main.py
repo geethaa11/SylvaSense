@@ -148,6 +148,52 @@ def get_or_download_band(scene_id, band_name, asset_dict, token):
             
     return cache_path
 
+S1_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache", "rasters", "sentinel1")
+os.makedirs(S1_CACHE_DIR, exist_ok=True)
+
+def get_or_download_s1_band(scene_id, band_name, asset_dict, token):
+    alternates = asset_dict.get("alternate", {})
+    if "https" in alternates and "href" in alternates["https"]:
+        href = alternates["https"]["href"]
+    else:
+        href = asset_dict.get("href")
+        if href and href.startswith("s3://"):
+            raise ValueError("Sentinel-1 asset download failed: S3 URL returned but no HTTPS alternate available.")
+
+    ext = ".tif"
+    cache_path = os.path.join(S1_CACHE_DIR, f"{scene_id}_{band_name}{ext}")
+    part_path = cache_path + ".part"
+
+    is_valid = False
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        try:
+            with rasterio.open(cache_path) as src:
+                _ = src.meta
+            is_valid = True
+            logging.info(f"CACHE HIT: S1 {band_name}")
+        except Exception:
+            logging.warning(f"CACHE INVALID: S1 {band_name}")
+            os.remove(cache_path)
+
+    if not is_valid:
+        logging.info(f"CACHE MISS: downloading S1 {band_name}")
+        headers = {"Authorization": f"Bearer {token}"}
+        resp = requests.get(href, headers=headers, stream=True)
+        if not resp.ok:
+            raise ValueError(f"Sentinel-1 asset download failed: HTTP {resp.status_code}")
+        try:
+            with open(part_path, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+            os.rename(part_path, cache_path)
+        except Exception as e:
+            if os.path.exists(part_path):
+                os.remove(part_path)
+            raise e
+            
+    return cache_path
+
 def clip_band(local_path, aoi_shape):
     """Clip a local raster using rasterio mask."""
     with rasterio.open(local_path) as src:
@@ -252,9 +298,17 @@ def analyze_aoi(req: AnalysisRequest):
     b04_asset = assets.get("B04_10m")
     b08_asset = assets.get("B08_10m")
 
-    # Check Sentinel-1 Connectivity
+    # Check Sentinel-1 Connectivity and Process SAR
     s1_connected = False
+    s1_used = False
+    s1_scene_id = None
+    s1_pol = None
+    s1_vv_mean = 0.0
+    s1_valid_pixels = 0
+    s1_processing_msg = "Unavailable"
+    
     try:
+        t0_s1 = time.time()
         from datetime import datetime, timedelta
         s1_datetime = None
         if acq_date and acq_date != "Unknown":
@@ -274,12 +328,7 @@ def analyze_aoi(req: AnalysisRequest):
         }
         if s1_datetime:
             s1_payload["datetime"] = s1_datetime
-
-        logging.info(f"Sentinel-1 check - AOI bounding box: {geom_dict}")
-        logging.info(f"Sentinel-1 check - STAC endpoint: {stac_search_url}")
-        logging.info(f"Sentinel-1 check - collection being queried: {s1_payload['collections']}")
-        logging.info(f"Sentinel-1 check - datetime range: {s1_datetime or '(no explicit range)'}")
-        
+            
         s1_resp = requests.post(
             stac_search_url, 
             json=s1_payload, 
@@ -287,16 +336,45 @@ def analyze_aoi(req: AnalysisRequest):
             timeout=10
         )
         
-        logging.info(f"Sentinel-1 check - HTTP status code: {s1_resp.status_code}")
+        s1_asset = None
         if s1_resp.status_code == 200:
             features = s1_resp.json().get("features", [])
-            logging.info(f"Sentinel-1 check - number of Sentinel-1 results returned: {len(features)}")
             if len(features) > 0:
                 s1_connected = True
-        else:
-            logging.error(f"Sentinel-1 check - response error/message: {s1_resp.text}")
+                s1_feature = features[0]
+                s1_scene_id = s1_feature.get("id")
+                s1_assets = s1_feature.get("assets", {})
+                if "vv" in s1_assets:
+                    s1_pol = "VV"
+                    s1_asset = s1_assets["vv"]
+                elif "vh" in s1_assets:
+                    s1_pol = "VH"
+                    s1_asset = s1_assets["vh"]
+        logging.info(f"[PERF] S1_STAC: {time.time() - t0_s1:.2f}s")
+        
+        if s1_connected and s1_asset:
+            t0_dl = time.time()
+            s1_path = get_or_download_s1_band(s1_scene_id, s1_pol, s1_asset, token)
+            logging.info(f"[PERF] S1_DOWNLOAD: {time.time() - t0_dl:.2f}s")
+            
+            t0_clip = time.time()
+            s1_arr, _, _ = clip_band(s1_path, aoi_shape)
+            logging.info(f"[PERF] S1_CLIP: {time.time() - t0_clip:.2f}s")
+            
+            t0_ana = time.time()
+            s1_arr_float = s1_arr.astype(np.float32)
+            valid_mask = s1_arr_float > 0
+            s1_valid_pixels = int(np.sum(valid_mask))
+            if s1_valid_pixels > 0:
+                # Basic conversion to dB for GRD amplitude
+                db_arr = 20 * np.log10(s1_arr_float[valid_mask] + 1e-10)
+                s1_vv_mean = float(np.mean(db_arr))
+                s1_used = True
+                s1_processing_msg = f"{s1_pol} SAR backscatter"
+            logging.info(f"[PERF] S1_ANALYSIS: {time.time() - t0_ana:.2f}s")
+            
     except Exception as e:
-        logging.error(f"Sentinel-1 connectivity check failed: {e}")
+        logging.error(f"Sentinel-1 connectivity/processing failed: {e}")
 
     metadata = {
         "scene_id": scene_id,
@@ -305,8 +383,14 @@ def analyze_aoi(req: AnalysisRequest):
         "resolution_m": 10,
         "bands": [],
         "sentinel1_connected": s1_connected,
-        "sentinel1_processing": "Not used for this measurement"
+        "sentinel1_used": s1_used,
+        "sentinel1_processing": s1_processing_msg
     }
+    if s1_used:
+        metadata["sentinel1_polarization"] = s1_pol
+        metadata["sentinel1_scene_id"] = s1_scene_id
+        metadata["sentinel1_vv_mean_db"] = round(s1_vv_mean, 2)
+        metadata["sentinel1_valid_pixels"] = s1_valid_pixels
     
     logging.info(f"selected scene ID: {scene_id}")
     logging.info(f"acquisition date: {acq_date}")
