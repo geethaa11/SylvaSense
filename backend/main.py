@@ -58,6 +58,8 @@ def health_check():
     return {
         "backend": "Connected",
         "raster": "Ready",
+        "sentinel2": catalog_status,
+        "sentinel1": catalog_status,
         "copernicus_catalog": catalog_status,
         "authentication": "Configured" if (USERNAME and PASSWORD) else "Not Configured"
     }
@@ -249,12 +251,34 @@ def analyze_aoi(req: AnalysisRequest):
     b04_asset = assets.get("B04_10m")
     b08_asset = assets.get("B08_10m")
 
+    # Check Sentinel-1 Connectivity
+    s1_connected = False
+    try:
+        s1_payload = {
+            "collections": ["sentinel-1-grd"],
+            "intersects": geom_dict,
+            "limit": 1,
+            "sortby": [{"field": "properties.datetime", "direction": "desc"}]
+        }
+        s1_resp = requests.post(
+            stac_search_url, 
+            json=s1_payload, 
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            timeout=5
+        )
+        if s1_resp.status_code == 200 and len(s1_resp.json().get("features", [])) > 0:
+            s1_connected = True
+    except Exception as e:
+        logging.warning(f"Sentinel-1 connectivity check failed: {e}")
+
     metadata = {
         "scene_id": scene_id,
         "acquisition_date": acq_date,
         "cloud_cover": cloud_cover,
         "resolution_m": 10,
-        "bands": []
+        "bands": [],
+        "sentinel1_connected": s1_connected,
+        "sentinel1_processing": "Not used for this measurement"
     }
     
     logging.info(f"selected scene ID: {scene_id}")

@@ -103,7 +103,7 @@ function App() {
   const [demoFeatures, setDemoFeatures] = useState(null);
   const [demoObjects, setDemoObjects] = useState([]);
   
-  const [liveDataStatus, setLiveDataStatus] = useState({ backend: 'Checking...', satellite: 'Unknown', raster: 'Unknown' });
+  const [liveDataStatus, setLiveDataStatus] = useState({ backend: 'Checking...', sentinel2: 'Checking...', sentinel1: 'Checking...', raster: 'Unknown' });
   const [isAnalyzing, setIsAnalyzing] = useState(false);
 
   const API_BASE_URL = import.meta.env.VITE_API_BASE_URL || 'http://127.0.0.1:8001';
@@ -112,7 +112,7 @@ function App() {
     fetch(`${API_BASE_URL}/api/health`)
       .then(res => res.json())
       .then(data => setLiveDataStatus(data))
-      .catch(() => setLiveDataStatus({ backend: 'Unavailable', satellite: 'Unavailable', raster: 'Unavailable' }));
+      .catch(() => setLiveDataStatus({ backend: 'Unavailable', sentinel2: 'Unavailable', sentinel1: 'Unavailable', raster: 'Unavailable' }));
   }, []);
 
   useEffect(() => {
@@ -248,6 +248,10 @@ function App() {
     })
     .then(data => {
       setIsAnalyzing(false);
+      
+      const s1Status = data.metadata_found?.sentinel1_connected ? 'Connected' : 'Unavailable';
+      setLiveDataStatus(prev => ({ ...prev, sentinel1: s1Status, sentinel2: 'Connected' }));
+      
       if (data.api_state === 'NO_DATA') {
          setStatus('REVIEW — No suitable satellite data found');
          handleApiFailure(type, data);
@@ -435,7 +439,8 @@ function App() {
           <div className="status-bar" style={{fontSize: '11px', marginBottom: 0, background: '#f8fafc', borderColor: '#e2e8f0'}}>
             <strong style={{color: '#475569', marginRight: '10px'}}>LIVE DATA CONNECTION:</strong>
             <span style={{marginRight: '8px'}}>Backend: <span style={{color: liveDataStatus.backend === 'Connected' ? '#16a34a' : '#ef4444'}}>{liveDataStatus.backend}</span></span> |
-            <span style={{margin: '0 8px'}}>Satellite: <span style={{color: liveDataStatus.satellite === 'Checking...' ? '#f59e0b' : '#ef4444'}}>{liveDataStatus.satellite}</span></span> |
+            <span style={{margin: '0 8px'}}>Sentinel-2: <span style={{color: liveDataStatus.sentinel2 === 'Connected' ? '#16a34a' : '#f59e0b'}}>{liveDataStatus.sentinel2 || 'Checking...'}</span></span> |
+            <span style={{margin: '0 8px'}}>Sentinel-1: <span style={{color: liveDataStatus.sentinel1 === 'Connected' ? '#16a34a' : '#f59e0b'}}>{liveDataStatus.sentinel1 || 'Checking...'}</span></span> |
             <span style={{marginLeft: '8px'}}>Raster Processing: <span style={{color: liveDataStatus.raster === 'Ready' ? '#16a34a' : '#ef4444'}}>{liveDataStatus.raster}</span></span>
           </div>
         </div>
