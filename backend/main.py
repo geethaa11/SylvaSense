@@ -452,50 +452,70 @@ def analyze_aoi(req: AnalysisRequest):
     import concurrent.futures
     s1_meta = {}
     logging.info("[ANALYZE] START")
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        logging.info("[ANALYZE] S1 task started")
-        s1_future = executor.submit(process_sentinel1, token, geom_dict, acq_date, aoi_shape)
-        b04_future = None
-        b08_future = None
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    
+    logging.info("[ANALYZE] S1 task started")
+    s1_future = executor.submit(process_sentinel1, token, geom_dict, acq_date, aoi_shape)
+    b04_future = None
+    b08_future = None
+    
+    if b04_asset:
+        logging.info("[ANALYZE] B04 task started")
+        b04_future = executor.submit(get_or_download_band, scene_id, "B04_10m", b04_asset, token)
+    if b08_asset:
+        logging.info("[ANALYZE] B08 task started")
+        b08_future = executor.submit(get_or_download_band, scene_id, "B08_10m", b08_asset, token)
         
-        if b04_asset:
-            logging.info("[ANALYZE] B04 task started")
-            b04_future = executor.submit(get_or_download_band, scene_id, "B04_10m", b04_asset, token)
-        if b08_asset:
-            logging.info("[ANALYZE] B08 task started")
-            b08_future = executor.submit(get_or_download_band, scene_id, "B08_10m", b08_asset, token)
-            
-        try:
-            s1_meta = s1_future.result()
-            logging.info("[ANALYZE] S1 task completed")
-        except Exception as e:
-            import traceback
-            logging.error(f"[ANALYZE] S1 task failed: {e}\n{traceback.format_exc()}")
-            s1_meta = {}
-            
-        metadata.update(s1_meta)
-        try:
-            t_s2_dl0 = time.time()
-            if b04_future:
-                b04_path = b04_future.result()
-                logging.info("[ANALYZE] B04 task completed")
-            else:
-                b04_path = None
-            logging.info(f"[PERF] S2_B04: {time.time() - t_s2_dl0:.2f}s (parallel wait)")
-            t_s2_dl1 = time.time()
-            if b08_future:
-                b08_path = b08_future.result()
-                logging.info("[ANALYZE] B08 task completed")
-            else:
-                b08_path = None
-            logging.info(f"[PERF] S2_B08: {time.time() - t_s2_dl1:.2f}s (parallel wait)")
-        except Exception as e:
-            import traceback
-            logging.error(f"[ANALYZE] B04/B08 task failed: {e}\n{traceback.format_exc()}")
-            logging.error(f"[ERROR] ANALYZE failed: {e}\n{traceback.format_exc()}")
-            resp = make_failure(f"Failed to retrieve Sentinel-2 data: {e}")
-            resp["metadata_found"] = metadata
-            return resp
+    logging.info("[S1] HARD_TIMEOUT_START")
+    try:
+        s1_meta = s1_future.result(timeout=15.0)
+        logging.info("[S1] HARD_TIMEOUT_END")
+        logging.info("[ANALYZE] S1 task completed")
+    except concurrent.futures.TimeoutError:
+        logging.error("[S1] HARD_TIMEOUT_TRIGGERED: Sentinel-1 operation exceeded 15-second limit")
+        s1_meta = {
+            "sentinel1_connected": False,
+            "sentinel1_used": False,
+            "sentinel1_processing": "Unavailable",
+            "sentinel1_reason": "Sentinel-1 operation exceeded 15-second limit"
+        }
+    except Exception as e:
+        import traceback
+        logging.error(f"[ANALYZE] S1 task failed: {e}\n{traceback.format_exc()}")
+        s1_meta = {
+            "sentinel1_connected": False,
+            "sentinel1_used": False,
+            "sentinel1_processing": "Unavailable",
+            "sentinel1_reason": f"S1 task failed: {e}"
+        }
+        
+    metadata.update(s1_meta)
+    try:
+        t_s2_dl0 = time.time()
+        if b04_future:
+            b04_path = b04_future.result()
+            logging.info("[ANALYZE] B04 task completed")
+        else:
+            b04_path = None
+        logging.info(f"[PERF] S2_B04: {time.time() - t_s2_dl0:.2f}s (parallel wait)")
+        
+        t_s2_dl1 = time.time()
+        if b08_future:
+            b08_path = b08_future.result()
+            logging.info("[ANALYZE] B08 task completed")
+        else:
+            b08_path = None
+        logging.info(f"[PERF] S2_B08: {time.time() - t_s2_dl1:.2f}s (parallel wait)")
+    except Exception as e:
+        import traceback
+        logging.error(f"[ANALYZE] B04/B08 task failed: {e}\n{traceback.format_exc()}")
+        logging.error(f"[ERROR] ANALYZE failed: {e}\n{traceback.format_exc()}")
+        resp = make_failure(f"Failed to retrieve Sentinel-2 data: {e}")
+        resp["metadata_found"] = metadata
+        executor.shutdown(wait=False)
+        return resp
+        
+    executor.shutdown(wait=False)
 
     if b04_asset:
         alt_href = b04_asset.get("alternate", {}).get("https", {}).get("href")
