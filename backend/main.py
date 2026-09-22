@@ -196,12 +196,13 @@ def analyze_aoi(req: AnalysisRequest):
         
     t0 = time.time()
     best_item_dict = None
+    stac_search_url = STAC_URL.rstrip('/') + '/search'
+    
     if STAC_CACHE["best_item_dict"] and time.time() < STAC_CACHE["expires_at"]:
         best_item_dict = STAC_CACHE["best_item_dict"]
         logging.info("[SCENE CACHE HIT]")
     else:
         logging.info("[SCENE CACHE MISS]")
-        stac_search_url = STAC_URL.rstrip('/') + '/search'
         payload = {
             "collections": ["sentinel-2-l2a"],
             "intersects": geom_dict,
