@@ -351,8 +351,8 @@ function App() {
           <div className="header-actions">
             <button className="btn-text" onClick={() => setExplainerOpen(true)}>How SylvaSense Decides</button>
             <div className="demo-badge">
-              <strong>PROTOTYPE — DEMONSTRATION DATA</strong>
-              <span>Production connects to live inference & calibrated data</span>
+              <strong>PROTOTYPE — LIVE DATA DEMONSTRATION</strong>
+              <span>Live Sentinel-2 raster extraction • Evidence-bounded results • Production calibration and higher-resolution validation planned</span>
             </div>
           </div>
         </div>
