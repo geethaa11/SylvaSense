@@ -101,54 +101,75 @@ os.makedirs(CACHE_DIR, exist_ok=True)
 
 def get_or_download_band(scene_id, band_name, asset_dict, token):
     """Check cache, validate, or download via HTTPS to a .part file."""
+    b_label = band_name.split('_')[0] if '_' in band_name else band_name
+    
     try:
+        logging.info(f"[S2] {b_label} DOWNLOAD_START")
+        
         # Find HTTPS alternate URL instead of default S3
+        url_type = "default"
         alternates = asset_dict.get("alternate", {})
         if "https" in alternates and "href" in alternates["https"]:
             href = alternates["https"]["href"]
+            url_type = "https alternate"
         else:
             href = asset_dict.get("href")
             if href and href.startswith("s3://"):
                 raise ValueError("Sentinel-2 asset download failed: S3 URL returned but no HTTPS alternate available.")
 
+        logging.info(f"[S2] {b_label} URL_TYPE: {url_type} ({href})")
+
         ext = ".jp2" if ".jp2" in href.lower() else ".tif"
         cache_path = os.path.join(CACHE_DIR, f"{scene_id}_{band_name}{ext}")
         part_path = cache_path + ".part"
 
+        logging.info(f"[S2] {b_label} CACHE_PATH: {cache_path}")
+        cache_exists = os.path.exists(cache_path)
+        logging.info(f"[S2] {b_label} CACHE_EXISTS: {cache_exists}")
+
         # CACHE VALIDATION
         is_valid = False
-        if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        if cache_exists and os.path.getsize(cache_path) > 0:
             try:
                 with rasterio.Env():
                     with rasterio.open(cache_path) as src:
                         _ = src.meta
                 is_valid = True
-                logging.info(f"CACHE HIT: {band_name}")
-            except Exception:
-                logging.warning(f"CACHE INVALID: {band_name}")
+                logging.info(f"[S2] {b_label} CACHE_HIT")
+            except Exception as e:
+                logging.warning(f"CACHE INVALID: {band_name} - {e}")
                 os.remove(cache_path)
 
         # SAFE DOWNLOAD
         if not is_valid:
-            logging.info(f"CACHE MISS: downloading {band_name}")
+            logging.info(f"[S2] {b_label} CACHE_MISS")
             
             headers = {"Authorization": f"Bearer {token}"}
             resp = requests.get(href, headers=headers, stream=True)
             
+            logging.info(f"[S2] {b_label} DOWNLOAD_STATUS: HTTP {resp.status_code}")
             if not resp.ok:
                 raise ValueError(f"Sentinel-2 asset download failed: HTTP {resp.status_code}")
                 
+            content_length = resp.headers.get('Content-Length')
+            logging.info(f"[S2] {b_label} CONTENT_LENGTH: {content_length}")
+                
             try:
+                bytes_downloaded = 0
                 with open(part_path, "wb") as f:
                     for chunk in resp.iter_content(chunk_size=8192):
                         if chunk:
                             f.write(chunk)
+                            bytes_downloaded += len(chunk)
+                            
+                logging.info(f"[S2] {b_label} BYTES_DOWNLOADED: {bytes_downloaded}")
                 os.rename(part_path, cache_path)
             except Exception as e:
                 if os.path.exists(part_path):
                     os.remove(part_path)
                 raise e
                 
+        logging.info(f"[S2] {b_label} DOWNLOAD_END")
         return cache_path
     except Exception as e:
         import traceback
