@@ -176,6 +176,59 @@ def get_or_download_band(scene_id, band_name, asset_dict, token):
         logging.error(f"[ERROR] S2 {band_name} processing failed: {e}\n{traceback.format_exc()}")
         raise e
 
+def get_remote_clipped_band(scene_id, band_name, asset_dict, token, aoi_shape):
+    """Try remote windowed access via /vsicurl/. Fallback to full download and local clip."""
+    b_label = band_name.split('_')[0] if '_' in band_name else band_name
+    
+    url_type = "default"
+    alternates = asset_dict.get("alternate", {})
+    if "https" in alternates and "href" in alternates["https"]:
+        href = alternates["https"]["href"]
+        url_type = "https alternate"
+    else:
+        href = asset_dict.get("href")
+        
+    logging.info(f"[S2] {b_label} REMOTE_WINDOW_START")
+    logging.info(f"[S2] {b_label} REMOTE_WINDOW_URL_TYPE: {url_type} ({href})")
+    logging.info(f"[S2] {b_label} REMOTE_WINDOW_SUPPORTED: Checking")
+    
+    try:
+        import geopandas as gpd
+        logging.info(f"[S2] {b_label} REMOTE_WINDOW_READ_START")
+        
+        # Ensure we use GDAL curl driver
+        vsi_href = href if href.startswith("/vsi") else ("/vsicurl/" + href.replace("https://", "https://"))
+        if href.startswith("https://"):
+            vsi_href = "/vsicurl/" + href
+            
+        with rasterio.Env(
+            GDAL_HTTP_HEADERS=f"Authorization: Bearer {token}",
+            GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+            CPL_VSIL_CURL_ALLOWED_EXTENSIONS="tif,jp2,tiff",
+            VSI_CACHE="TRUE",
+            VSI_CACHE_SIZE="5000000",
+            GDAL_HTTP_UNSUPPORTED_REST_METHOD="YES",
+            CPL_VSIL_CURL_USE_HEAD="NO"
+        ):
+            with rasterio.open(vsi_href) as src:
+                aoi_gdf = gpd.GeoDataFrame(geometry=[aoi_shape], crs="EPSG:4326")
+                aoi_gdf_proj = aoi_gdf.to_crs(src.crs)
+                
+                # Mask reads ONLY the required window!
+                out_image, out_transform = mask(src, [aoi_gdf_proj.geometry.values[0]], crop=True)
+                
+        logging.info(f"[S2] {b_label} REMOTE_WINDOW_READ_END")
+        logging.info(f"[S2] {b_label} REMOTE_WINDOW_SUCCESS")
+        return out_image[0], out_transform, src.crs
+        
+    except Exception as e:
+        logging.warning(f"[S2] {b_label} REMOTE_WINDOW_FAILED: {e}")
+        logging.info(f"[S2] {b_label} FALLBACK_FULL_DOWNLOAD")
+        
+        # Fallback to local full download and local clipping
+        local_path = get_or_download_band(scene_id, band_name, asset_dict, token)
+        return clip_band(local_path, aoi_shape)
+
 S1_CACHE_DIR = os.path.join(os.path.dirname(__file__), "cache", "rasters", "sentinel1")
 os.makedirs(S1_CACHE_DIR, exist_ok=True)
 
@@ -488,25 +541,25 @@ def analyze_aoi(req: AnalysisRequest):
     
     if b04_asset:
         logging.info("[ANALYZE] B04 task started")
-        b04_future = executor.submit(get_or_download_band, scene_id, "B04_10m", b04_asset, token)
+        b04_future = executor.submit(get_remote_clipped_band, scene_id, "B04_10m", b04_asset, token, aoi_shape)
     if b08_asset:
         logging.info("[ANALYZE] B08 task started")
-        b08_future = executor.submit(get_or_download_band, scene_id, "B08_10m", b08_asset, token)
+        b08_future = executor.submit(get_remote_clipped_band, scene_id, "B08_10m", b08_asset, token, aoi_shape)
     try:
         logging.info(f"[PERF] B04_START: {time.time() - t0_total:.2f}s")
         if b04_future:
-            b04_path = b04_future.result()
+            red_arr, transform, crs = b04_future.result()
             logging.info("[ANALYZE] B04 task completed")
         else:
-            b04_path = None
+            red_arr = None
         logging.info(f"[PERF] B04_END: {time.time() - t0_total:.2f}s")
         
         logging.info(f"[PERF] B08_START: {time.time() - t0_total:.2f}s")
         if b08_future:
-            b08_path = b08_future.result()
+            nir_arr, _, _ = b08_future.result()
             logging.info("[ANALYZE] B08 task completed")
         else:
-            b08_path = None
+            nir_arr = None
         logging.info(f"[PERF] B08_END: {time.time() - t0_total:.2f}s")
     except Exception as e:
         import traceback
@@ -533,8 +586,9 @@ def analyze_aoi(req: AnalysisRequest):
     # Step 4 & 5: Clip Rasters (Downloads handled concurrently above)
     try:
         logging.info(f"[PERF] CLIP_START: {time.time() - t0_total:.2f}s")
-        red_arr, transform, crs = clip_band(b04_path, aoi_shape)
-        nir_arr, _, _ = clip_band(b08_path, aoi_shape)
+        # Arrays are already clipped by get_remote_clipped_band
+        if red_arr is None or nir_arr is None:
+            raise ValueError("Arrays missing after processing.")
         logging.info(f"[PERF] CLIP_END: {time.time() - t0_total:.2f}s")
         
     except ValueError as ve:
