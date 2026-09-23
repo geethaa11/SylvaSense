@@ -254,12 +254,16 @@ function App() {
     setAnalysisResult(null);
     setProofOpen(false);
 
+    const t_start = performance.now();
+    console.log('[FRONTEND] ANALYZE_REQUEST_START: 0.00ms');
+
     fetch(`${API_BASE_URL}/api/analyze`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ aoi: polygonGeoJSON, measurement: type })
     })
     .then(res => {
+      console.log('[FRONTEND] ANALYZE_RESPONSE_RECEIVED: ' + (performance.now() - t_start).toFixed(2) + 'ms');
       if (!res.ok) throw new Error('Backend error');
       return res.json();
     })
@@ -279,12 +283,16 @@ function App() {
          setStatus('Live satellite analysis completed');
          handleApiSuccess(type, data);
       }
+      
+      setTimeout(() => console.log('[FRONTEND] ANALYZE_RENDER_COMPLETE: ' + (performance.now() - t_start).toFixed(2) + 'ms'), 0);
     })
     .catch(err => {
+      console.log('[FRONTEND] ANALYZE_RESPONSE_RECEIVED (Error): ' + (performance.now() - t_start).toFixed(2) + 'ms');
       console.error(err);
       setIsAnalyzing(false);
       setStatus('REVIEW — Live analysis service unavailable');
       handleApiFailure(type, { api_state: 'BACKEND_UNAVAILABLE', reason: 'Live analysis service unavailable. Please check the backend connection.', metadata_found: null });
+      setTimeout(() => console.log('[FRONTEND] ANALYZE_RENDER_COMPLETE: ' + (performance.now() - t_start).toFixed(2) + 'ms'), 0);
     });
   }
 

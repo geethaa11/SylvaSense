@@ -364,21 +364,21 @@ def analyze_aoi(req: AnalysisRequest):
         return resp
 
     t0_total = time.time()
+    logging.info(f"[PERF] REQUEST_START: {time.time() - t0_total:.2f}s")
     try:
         geom_dict = req.aoi["features"][0]["geometry"] if "features" in req.aoi else req.aoi["geometry"]
         aoi_shape = shape(geom_dict)
     except Exception as e:
         return make_failure("Invalid AOI geometry provided.")
 
-    t0 = time.time()
+    logging.info(f"[PERF] AUTH_START: {time.time() - t0_total:.2f}s")
     try:
         token = get_token()
     except ValueError as ve:
         return make_failure(str(ve))
-    t_auth = time.time() - t0
-    logging.info(f"[PERF] AUTH: {t_auth:.2f}s")
+    logging.info(f"[PERF] AUTH_END: {time.time() - t0_total:.2f}s")
         
-    t0 = time.time()
+    logging.info(f"[PERF] STAC_START: {time.time() - t0_total:.2f}s")
     best_item_dict = None
     stac_search_url = STAC_URL.rstrip('/') + '/search'
     
@@ -422,8 +422,7 @@ def analyze_aoi(req: AnalysisRequest):
         if not best_item_dict:
             return make_failure("No suitable Sentinel-2 scene was found for this AOI and time window.")
             
-    t_stac = time.time() - t0
-    logging.info(f"[PERF] STAC: {t_stac:.2f}s")
+    logging.info(f"[PERF] STAC_END: {time.time() - t0_total:.2f}s")
         
     # Extract metadata
     scene_id = best_item_dict.get("id")
@@ -473,21 +472,21 @@ def analyze_aoi(req: AnalysisRequest):
         logging.info("[ANALYZE] B08 task started")
         b08_future = executor.submit(get_or_download_band, scene_id, "B08_10m", b08_asset, token)
     try:
-        t_s2_dl0 = time.time()
+        logging.info(f"[PERF] B04_START: {time.time() - t0_total:.2f}s")
         if b04_future:
             b04_path = b04_future.result()
             logging.info("[ANALYZE] B04 task completed")
         else:
             b04_path = None
-        logging.info(f"[PERF] S2_B04: {time.time() - t_s2_dl0:.2f}s (parallel wait)")
+        logging.info(f"[PERF] B04_END: {time.time() - t0_total:.2f}s")
         
-        t_s2_dl1 = time.time()
+        logging.info(f"[PERF] B08_START: {time.time() - t0_total:.2f}s")
         if b08_future:
             b08_path = b08_future.result()
             logging.info("[ANALYZE] B08 task completed")
         else:
             b08_path = None
-        logging.info(f"[PERF] S2_B08: {time.time() - t_s2_dl1:.2f}s (parallel wait)")
+        logging.info(f"[PERF] B08_END: {time.time() - t0_total:.2f}s")
     except Exception as e:
         import traceback
         logging.error(f"[ANALYZE] B04/B08 task failed: {e}\n{traceback.format_exc()}")
@@ -512,11 +511,10 @@ def analyze_aoi(req: AnalysisRequest):
 
     # Step 4 & 5: Clip Rasters (Downloads handled concurrently above)
     try:
-        t0 = time.time()
+        logging.info(f"[PERF] CLIP_START: {time.time() - t0_total:.2f}s")
         red_arr, transform, crs = clip_band(b04_path, aoi_shape)
         nir_arr, _, _ = clip_band(b08_path, aoi_shape)
-        t_clip = time.time() - t0
-        logging.info(f"[PERF] CLIP: {t_clip:.2f}s")
+        logging.info(f"[PERF] CLIP_END: {time.time() - t0_total:.2f}s")
         
     except ValueError as ve:
         # Pass through the specific ValueError (e.g., HTTP 403, 404, etc.)
@@ -532,7 +530,7 @@ def analyze_aoi(req: AnalysisRequest):
 
     # Step 6: Real NDVI Calculation
     try:
-        t0 = time.time()
+        logging.info(f"[PERF] NDVI_START: {time.time() - t0_total:.2f}s")
         # Convert to float for math
         red = red_arr.astype(np.float32)
         nir = nir_arr.astype(np.float32)
@@ -560,11 +558,10 @@ def analyze_aoi(req: AnalysisRequest):
         canopy_pixels = int(np.sum(canopy_mask))
         canopy_cover_percent = (canopy_pixels / valid_pixels) * 100.0
         
-        t_ndvi = time.time() - t0
-        logging.info(f"[PERF] NDVI: {t_ndvi:.2f}s")
+        logging.info(f"[PERF] NDVI_END: {time.time() - t0_total:.2f}s")
 
         # Step 8: Canopy Objects & GeoJSON
-        t0 = time.time()
+        logging.info(f"[PERF] POLYGONIZE_START: {time.time() - t0_total:.2f}s")
         # Generate polygon geometries from the binary mask
         import geopandas as gpd
         mask_uint8 = canopy_mask.astype(np.uint8)
@@ -600,13 +597,10 @@ def analyze_aoi(req: AnalysisRequest):
         else:
             geojson_dict = {"type": "FeatureCollection", "features": []}
             
-        t_poly = time.time() - t0
-        logging.info(f"[PERF] POLYGONIZE: {t_poly:.2f}s")
-
-        t_total = time.time() - t0_total
-        logging.info(f"[PERF] TOTAL: {t_total:.2f}s")
+        logging.info(f"[PERF] POLYGONIZE_END: {time.time() - t0_total:.2f}s")
 
         # Step 9: Final Response Structure
+        logging.info(f"[PERF] RESPONSE_BUILD_START: {time.time() - t0_total:.2f}s")
         final_resp = {
             "status": "SUPPORTED" if req.measurement in ["ENUMERATION", "STRUCTURE"] else "REVIEW",
             "api_state": "LIVE",
@@ -626,6 +620,8 @@ def analyze_aoi(req: AnalysisRequest):
                 "reason": "Sentinel-2 spatial resolution (10m) does not support reliable individual-tree separation. Returning L3 Canopy Objects."
             }
         }
+        logging.info(f"[PERF] RESPONSE_BUILD_END: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] REQUEST_TOTAL: {time.time() - t0_total:.2f}s")
         logging.info(f"[ANALYZE] FINAL RESPONSE: {json.dumps(final_resp)}")
         return final_resp
         
