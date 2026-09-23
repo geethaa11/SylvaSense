@@ -46,6 +46,7 @@ class AnalysisRequest(BaseModel):
 
 AUTH_CACHE = {"token": None, "expires_at": 0}
 STAC_CACHE = {"best_item_dict": None, "expires_at": 0}
+S3_CRED_CACHE = {}
 
 @app.get("/api/health")
 def health_check():
@@ -307,14 +308,22 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
     try:
         logging.info("[S1] AUTH_START")
         
-        # 1. Get temporary S3 credentials
-        s3_cred_url = "https://s3-keys-manager.cloudferro.com/api/user/credentials"
-        cred_resp = requests.post(s3_cred_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
-        if not cred_resp.ok:
-            raise ValueError(f"Failed to fetch S3 credentials: {cred_resp.status_code} {cred_resp.text}")
-        s3_creds = cred_resp.json()
-        aws_access_key = s3_creds["access_id"]
-        aws_secret_key = s3_creds["secret"]
+        if S3_CRED_CACHE.get("access_id") and time.time() < S3_CRED_CACHE.get("expires_at", 0):
+            aws_access_key = S3_CRED_CACHE["access_id"]
+            aws_secret_key = S3_CRED_CACHE["secret"]
+        else:
+            s3_cred_url = "https://s3-keys-manager.cloudferro.com/api/user/credentials"
+            cred_resp = requests.post(s3_cred_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+            if not cred_resp.ok:
+                raise ValueError(f"Failed to fetch S3 credentials: {cred_resp.status_code} {cred_resp.text}")
+            
+            s3_creds = cred_resp.json()
+            
+            aws_access_key = s3_creds["access_id"]
+            aws_secret_key = s3_creds["secret"]
+            S3_CRED_CACHE["access_id"] = aws_access_key
+            S3_CRED_CACHE["secret"] = aws_secret_key
+            S3_CRED_CACHE["expires_at"] = time.time() + 3600
         
         logging.info("[S1] SEARCH_START")
         from datetime import datetime, timedelta
@@ -564,22 +573,22 @@ def analyze_aoi(req: AnalysisRequest):
         logging.info(f"[ANALYZE] FINAL RESPONSE (FAILURE): {json.dumps(resp)}")
         return resp
 
-    t0_total = time.time()
-    logging.info(f"[PERF] REQUEST_START: {time.time() - t0_total:.2f}s")
+    t0_total = time.perf_counter()
+    logging.info(f"[PERF] REQUEST_START: {time.perf_counter() - t0_total:.2f}s")
     try:
         geom_dict = req.aoi["features"][0]["geometry"] if "features" in req.aoi else req.aoi["geometry"]
         aoi_shape = shape(geom_dict)
     except Exception as e:
         return make_failure("Invalid AOI geometry provided.")
 
-    logging.info(f"[PERF] AUTH_START: {time.time() - t0_total:.2f}s")
+    logging.info(f"[PERF] AUTH_START: {time.perf_counter() - t0_total:.2f}s")
     try:
         token = get_token()
     except ValueError as ve:
         return make_failure(str(ve))
-    logging.info(f"[PERF] AUTH_END: {time.time() - t0_total:.2f}s")
+    logging.info(f"[PERF] AUTH_END: {time.perf_counter() - t0_total:.2f}s")
         
-    logging.info(f"[PERF] STAC_START: {time.time() - t0_total:.2f}s")
+    logging.info(f"[PERF] STAC_START: {time.perf_counter() - t0_total:.2f}s")
     best_item_dict = None
     stac_search_url = STAC_URL.rstrip('/') + '/search'
     
@@ -588,8 +597,14 @@ def analyze_aoi(req: AnalysisRequest):
         logging.info("[SCENE CACHE HIT]")
     else:
         logging.info("[SCENE CACHE MISS]")
+        from datetime import datetime, timedelta
+        now = datetime.utcnow()
+        start = now - timedelta(days=90)
+        time_str = f"{start.strftime('%Y-%m-%dT%H:%M:%SZ')}/{now.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+
         payload = {
             "collections": ["sentinel-2-l2a"],
+            "datetime": time_str,
             "intersects": geom_dict,
             "limit": 3,
             "query": {"eo:cloud_cover": {"lte": 20}},
@@ -623,7 +638,7 @@ def analyze_aoi(req: AnalysisRequest):
         if not best_item_dict:
             return make_failure("No suitable Sentinel-2 scene was found for this AOI and time window.")
             
-    logging.info(f"[PERF] STAC_END: {time.time() - t0_total:.2f}s")
+    logging.info(f"[PERF] STAC_END: {time.perf_counter() - t0_total:.2f}s")
         
     # Extract metadata
     scene_id = best_item_dict.get("id")
@@ -667,45 +682,23 @@ def analyze_aoi(req: AnalysisRequest):
         logging.info("[ANALYZE] B08 task started")
         b08_future = executor.submit(get_remote_clipped_band, scene_id, "B08_10m", b08_asset, token, aoi_shape)
         
-    s1_meta = {}
+    # S1 task is running concurrently. We will wait for it after S2 polygonization.
     try:
-        s1_meta = s1_future.result(timeout=15.0)
-        logging.info("[ANALYZE] S1 task completed")
-    except concurrent.futures.TimeoutError:
-        logging.error("[S1] HARD_TIMEOUT_TRIGGERED: Sentinel-1 operation exceeded 15-second limit")
-        s1_meta = {
-            "sentinel1_connected": False,
-            "sentinel1_used": False,
-            "sentinel1_processing": "Unavailable",
-            "sentinel1_reason": "Sentinel-1 operation exceeded 15-second limit"
-        }
-    except Exception as e:
-        import traceback
-        logging.error(f"[ANALYZE] S1 task failed: {e}\n{traceback.format_exc()}")
-        s1_meta = {
-            "sentinel1_connected": False,
-            "sentinel1_used": False,
-            "sentinel1_processing": "Unavailable",
-            "sentinel1_reason": f"S1 task failed: {e}"
-        }
-    metadata.update(s1_meta)
-    
-    try:
-        logging.info(f"[PERF] B04_START: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] B04_START: {time.perf_counter() - t0_total:.2f}s")
         if b04_future:
             red_arr, transform, crs = b04_future.result()
             logging.info("[ANALYZE] B04 task completed")
         else:
             red_arr = None
-        logging.info(f"[PERF] B04_END: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] B04_END: {time.perf_counter() - t0_total:.2f}s")
         
-        logging.info(f"[PERF] B08_START: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] B08_START: {time.perf_counter() - t0_total:.2f}s")
         if b08_future:
             nir_arr, _, _ = b08_future.result()
             logging.info("[ANALYZE] B08 task completed")
         else:
             nir_arr = None
-        logging.info(f"[PERF] B08_END: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] B08_END: {time.perf_counter() - t0_total:.2f}s")
     except Exception as e:
         import traceback
         logging.error(f"[ANALYZE] B04/B08 task failed: {e}\n{traceback.format_exc()}")
@@ -730,11 +723,11 @@ def analyze_aoi(req: AnalysisRequest):
 
     # Step 4 & 5: Clip Rasters (Downloads handled concurrently above)
     try:
-        logging.info(f"[PERF] CLIP_START: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] CLIP_START: {time.perf_counter() - t0_total:.2f}s")
         # Arrays are already clipped by get_remote_clipped_band
         if red_arr is None or nir_arr is None:
             raise ValueError("Arrays missing after processing.")
-        logging.info(f"[PERF] CLIP_END: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] CLIP_END: {time.perf_counter() - t0_total:.2f}s")
         
     except ValueError as ve:
         # Pass through the specific ValueError (e.g., HTTP 403, 404, etc.)
@@ -750,7 +743,7 @@ def analyze_aoi(req: AnalysisRequest):
 
     # Step 6: Real NDVI Calculation
     try:
-        logging.info(f"[PERF] NDVI_START: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] NDVI_START: {time.perf_counter() - t0_total:.2f}s")
         # Convert to float for math
         red = red_arr.astype(np.float32)
         nir = nir_arr.astype(np.float32)
@@ -778,10 +771,10 @@ def analyze_aoi(req: AnalysisRequest):
         canopy_pixels = int(np.sum(canopy_mask))
         canopy_cover_percent = (canopy_pixels / valid_pixels) * 100.0
         
-        logging.info(f"[PERF] NDVI_END: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] NDVI_END: {time.perf_counter() - t0_total:.2f}s")
 
         # Step 8: Canopy Objects & GeoJSON
-        logging.info(f"[PERF] POLYGONIZE_START: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] POLYGONIZE_START: {time.perf_counter() - t0_total:.2f}s")
         # Generate polygon geometries from the binary mask
         import geopandas as gpd
         mask_uint8 = canopy_mask.astype(np.uint8)
@@ -817,10 +810,34 @@ def analyze_aoi(req: AnalysisRequest):
         else:
             geojson_dict = {"type": "FeatureCollection", "features": []}
             
-        logging.info(f"[PERF] POLYGONIZE_END: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] POLYGONIZE_END: {time.perf_counter() - t0_total:.2f}s")
+        
+        # Wait for S1 task here (which has been running concurrently with B04/B08/NDVI)
+        s1_meta = {}
+        try:
+            s1_meta = s1_future.result(timeout=15.0)
+            logging.info("[ANALYZE] S1 task completed")
+        except concurrent.futures.TimeoutError:
+            logging.error("[S1] HARD_TIMEOUT_TRIGGERED: Sentinel-1 operation exceeded total time limit")
+            s1_meta = {
+                "sentinel1_connected": False,
+                "sentinel1_used": False,
+                "sentinel1_processing": "Unavailable",
+                "sentinel1_reason": "Sentinel-1 operation exceeded time limit"
+            }
+        except Exception as e:
+            import traceback
+            logging.error(f"[ANALYZE] S1 task failed: {e}\n{traceback.format_exc()}")
+            s1_meta = {
+                "sentinel1_connected": False,
+                "sentinel1_used": False,
+                "sentinel1_processing": "Unavailable",
+                "sentinel1_reason": f"S1 task failed: {e}"
+            }
+        metadata.update(s1_meta)
 
         # Step 9: Final Response Structure
-        logging.info(f"[PERF] RESPONSE_BUILD_START: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] RESPONSE_BUILD_START: {time.perf_counter() - t0_total:.2f}s")
         final_resp = {
             "status": "SUPPORTED" if req.measurement in ["ENUMERATION", "STRUCTURE"] else "REVIEW",
             "api_state": "LIVE",
@@ -840,8 +857,8 @@ def analyze_aoi(req: AnalysisRequest):
                 "reason": "Sentinel-2 spatial resolution (10m) does not support reliable individual-tree separation. Returning L3 Canopy Objects."
             }
         }
-        logging.info(f"[PERF] RESPONSE_BUILD_END: {time.time() - t0_total:.2f}s")
-        logging.info(f"[PERF] REQUEST_TOTAL: {time.time() - t0_total:.2f}s")
+        logging.info(f"[PERF] RESPONSE_BUILD_END: {time.perf_counter() - t0_total:.2f}s")
+        logging.info(f"[PERF] REQUEST_TOTAL: {time.perf_counter() - t0_total:.2f}s")
         logging.info(f"[ANALYZE] FINAL RESPONSE: {json.dumps(final_resp)}")
         return final_resp
         
