@@ -448,14 +448,21 @@ def analyze_aoi(req: AnalysisRequest):
         "bands": []
     }
 
-    # Launch parallel downloads and Sentinel-1 processing
+    # Launch parallel downloads (Sentinel-1 is skipped from the critical path)
     import concurrent.futures
-    s1_meta = {}
-    logging.info("[ANALYZE] START")
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
     
-    logging.info("[ANALYZE] S1 task started")
-    s1_future = executor.submit(process_sentinel1, token, geom_dict, acq_date, aoi_shape)
+    logging.info("[S1] SKIPPED_FROM_PRIMARY_REQUEST")
+    s1_meta = {
+        "sentinel1_connected": False,
+        "sentinel1_used": False,
+        "sentinel1_processing": "Unavailable",
+        "sentinel1_reason": "Sentinel-1 processing is isolated from the primary analysis path."
+    }
+    metadata.update(s1_meta)
+
+    logging.info("[ANALYZE] START")
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    
     b04_future = None
     b08_future = None
     
@@ -465,31 +472,6 @@ def analyze_aoi(req: AnalysisRequest):
     if b08_asset:
         logging.info("[ANALYZE] B08 task started")
         b08_future = executor.submit(get_or_download_band, scene_id, "B08_10m", b08_asset, token)
-        
-    logging.info("[S1] HARD_TIMEOUT_START")
-    try:
-        s1_meta = s1_future.result(timeout=15.0)
-        logging.info("[S1] HARD_TIMEOUT_END")
-        logging.info("[ANALYZE] S1 task completed")
-    except concurrent.futures.TimeoutError:
-        logging.error("[S1] HARD_TIMEOUT_TRIGGERED: Sentinel-1 operation exceeded 15-second limit")
-        s1_meta = {
-            "sentinel1_connected": False,
-            "sentinel1_used": False,
-            "sentinel1_processing": "Unavailable",
-            "sentinel1_reason": "Sentinel-1 operation exceeded 15-second limit"
-        }
-    except Exception as e:
-        import traceback
-        logging.error(f"[ANALYZE] S1 task failed: {e}\n{traceback.format_exc()}")
-        s1_meta = {
-            "sentinel1_connected": False,
-            "sentinel1_used": False,
-            "sentinel1_processing": "Unavailable",
-            "sentinel1_reason": f"S1 task failed: {e}"
-        }
-        
-    metadata.update(s1_meta)
     try:
         t_s2_dl0 = time.time()
         if b04_future:
