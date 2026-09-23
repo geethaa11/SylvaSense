@@ -196,11 +196,10 @@ def get_remote_clipped_band(scene_id, band_name, asset_dict, token, aoi_shape):
         import geopandas as gpd
         logging.info(f"[S2] {b_label} REMOTE_WINDOW_READ_START")
         
-        # Ensure we use GDAL curl driver
+        # Ensure we use GDAL curl driver and fix OData extension resolution
+        # Use standard /vsicurl/ format (GDAL 3+ handles OData redirects better)
         vsi_href = href if href.startswith("/vsi") else ("/vsicurl/" + href.replace("https://", "https://"))
-        if href.startswith("https://"):
-            vsi_href = "/vsicurl/" + href
-            
+                
         with rasterio.Env(
             GDAL_HTTP_HEADERS=f"Authorization: Bearer {token}",
             GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
@@ -300,7 +299,7 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
     try:
         import time
         t0_s1 = time.time()
-        logging.info("[PERF] S1_STAC_START")
+        logging.info("[S1] SEARCH_START")
         from datetime import datetime, timedelta
         s1_datetime = None
         if acq_date and acq_date != "Unknown":
@@ -330,14 +329,13 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
             timeout=10
         )
-        logging.info("[PERF] S1_STAC_END")
+        logging.info("[S1] SEARCH_END")
         
         s1_asset = None
         if s1_resp.status_code == 200:
             features = s1_resp.json().get("features", [])
             logging.info(f"[S1] number of matching items: {len(features)}")
             if len(features) > 0:
-                logging.info("[PERF] S1_ASSET_SELECTION")
                 s1_connected = True
                 s1_feature = features[0]
                 s1_scene_id = s1_feature.get("id")
@@ -365,31 +363,24 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
             s1_reason = f"STAC API returned HTTP {s1_resp.status_code}"
             
         if s1_connected and s1_asset:
-            logging.info("[PERF] S1_DOWNLOAD_START")
-            t0_dl = time.time()
-            s1_path = get_or_download_s1_band(s1_scene_id, s1_pol, s1_asset, token)
-            logging.info("[PERF] S1_DOWNLOAD_END")
-            logging.info(f"[PERF] S1_DOWNLOAD_LATENCY: {time.time() - t0_dl:.2f}s")
-            
-            logging.info("[PERF] S1_RASTER_OPEN")
+            logging.info("[S1] RASTER_START")
             t0_clip = time.time()
-            logging.info("[PERF] S1_CLIP")
-            s1_arr, _, _ = clip_band(s1_path, aoi_shape)
-            logging.info(f"[PERF] S1_CLIP_LATENCY: {time.time() - t0_clip:.2f}s")
+            s1_arr, _, _ = get_remote_clipped_band(s1_scene_id, s1_pol, s1_asset, token, aoi_shape)
+            logging.info("[S1] RASTER_END")
             
-            logging.info("[PERF] S1_ANALYSIS")
             t0_ana = time.time()
             s1_arr_float = s1_arr.astype(np.float32)
             valid_mask = s1_arr_float > 0
             s1_valid_pixels = int(np.sum(valid_mask))
             if s1_valid_pixels > 0:
-                db_arr = 20 * np.log10(s1_arr_float[valid_mask] + 1e-10)
+                # Basic scaling for Sentinel-1 GRD
+                db_arr = 10 * np.log10(s1_arr_float[valid_mask] + 1e-10)
                 s1_vv_mean = float(np.mean(db_arr))
                 s1_used = True
                 s1_processing_msg = f"{s1_pol} SAR backscatter"
             else:
                 s1_reason = "No valid S1 pixels within the AOI."
-            logging.info(f"[PERF] S1_ANALYSIS_LATENCY: {time.time() - t0_ana:.2f}s")
+            logging.info("[S1] PROCESSING_END")
             
     except requests.exceptions.Timeout:
         s1_reason = "Sentinel-1 STAC API or Download timed out."
@@ -400,7 +391,8 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
         logging.error(f"[ERROR] S1 processing failed: {e}\n{traceback.format_exc()}")
         logging.error(f"[S1] exact failure/exception: {s1_reason}")
 
-    logging.info(f"[PERF] S1_TOTAL: {time.time() - t0_s1:.2f}s")
+    t_total = time.time() - t0_s1
+    logging.info(f"[S1] TOTAL: {t_total:.2f}s")
     logging.info(f"[S1] final response used={str(s1_used).lower()}")
     
     meta = {
@@ -411,10 +403,12 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
     if not s1_used:
         meta["sentinel1_reason"] = s1_reason
     if s1_used:
-        meta["sentinel1_polarization"] = s1_pol
-        meta["sentinel1_scene_id"] = s1_scene_id
-        meta["sentinel1_vv_mean_db"] = round(s1_vv_mean, 2)
-        meta["sentinel1_valid_pixels"] = s1_valid_pixels
+        meta["sentinel1_scene"] = s1_scene_id
+        meta["sentinel1_polarizations"] = [s1_pol] if s1_pol else []
+        meta["sentinel1_statistics"] = {
+            "vv_mean_db": round(s1_vv_mean, 2),
+            "valid_pixels": s1_valid_pixels
+        }
         
     return meta
 
@@ -521,20 +515,14 @@ def analyze_aoi(req: AnalysisRequest):
         "bands": []
     }
 
-    # Launch parallel downloads (Sentinel-1 is skipped from the critical path)
+    # Launch parallel downloads and S1 processing
     import concurrent.futures
     
-    logging.info("[S1] SKIPPED_FROM_PRIMARY_REQUEST")
-    s1_meta = {
-        "sentinel1_connected": False,
-        "sentinel1_used": False,
-        "sentinel1_processing": "Unavailable",
-        "sentinel1_reason": "Sentinel-1 processing is isolated from the primary analysis path."
-    }
-    metadata.update(s1_meta)
-
     logging.info("[ANALYZE] START")
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    
+    logging.info("[ANALYZE] S1 task started")
+    s1_future = executor.submit(process_sentinel1, token, geom_dict, acq_date, aoi_shape)
     
     b04_future = None
     b08_future = None
@@ -545,6 +533,30 @@ def analyze_aoi(req: AnalysisRequest):
     if b08_asset:
         logging.info("[ANALYZE] B08 task started")
         b08_future = executor.submit(get_remote_clipped_band, scene_id, "B08_10m", b08_asset, token, aoi_shape)
+        
+    s1_meta = {}
+    try:
+        s1_meta = s1_future.result(timeout=15.0)
+        logging.info("[ANALYZE] S1 task completed")
+    except concurrent.futures.TimeoutError:
+        logging.error("[S1] HARD_TIMEOUT_TRIGGERED: Sentinel-1 operation exceeded 15-second limit")
+        s1_meta = {
+            "sentinel1_connected": False,
+            "sentinel1_used": False,
+            "sentinel1_processing": "Unavailable",
+            "sentinel1_reason": "Sentinel-1 operation exceeded 15-second limit"
+        }
+    except Exception as e:
+        import traceback
+        logging.error(f"[ANALYZE] S1 task failed: {e}\n{traceback.format_exc()}")
+        s1_meta = {
+            "sentinel1_connected": False,
+            "sentinel1_used": False,
+            "sentinel1_processing": "Unavailable",
+            "sentinel1_reason": f"S1 task failed: {e}"
+        }
+    metadata.update(s1_meta)
+    
     try:
         logging.info(f"[PERF] B04_START: {time.time() - t0_total:.2f}s")
         if b04_future:
