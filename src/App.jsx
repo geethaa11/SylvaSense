@@ -526,7 +526,7 @@ function App() {
             <div style={{padding: '12px', fontSize: '12px', background: '#f9fafb', borderTop: '1px solid #e0ece0'}}>
               <strong>CURRENT AOI DATA</strong><br/>
               Area: {areaHa.toFixed(2)} ha<br/>
-              Sentinel-2 (10m): LIVE • Sentinel-1 SAR: LIVE
+              Sentinel-2 (10m): LIVE • Sentinel-1 SAR: {analysisResult?.meta?.sentinel1_used ? 'LIVE' : 'NOT USED'}
             </div>
             )}
           </section>
