@@ -20,7 +20,27 @@ import warnings
 from rasterio.errors import NotGeoreferencedWarning
 warnings.filterwarnings('ignore', category=NotGeoreferencedWarning)
 
-app = FastAPI()
+from contextlib import asynccontextmanager
+
+CREATED_S3_CREDENTIALS = set()
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    yield
+    if CREATED_S3_CREDENTIALS:
+        try:
+            token = get_token()
+            for access_id in CREATED_S3_CREDENTIALS:
+                try:
+                    del_url = f"https://s3-keys-manager.cloudferro.com/api/user/credentials/access_id/{access_id}"
+                    requests.delete(del_url, headers={"Authorization": f"Bearer {token}"}, timeout=5)
+                    logging.info("[S3] Cleaned up temporary credential")
+                except Exception as e:
+                    logging.error(f"[S3] Failed to clean up temporary credential: {e}")
+        except Exception as e:
+            logging.error(f"[S3] Failed to get token for cleanup: {e}")
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -304,26 +324,39 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
     import geopandas as gpd
     import xml.etree.ElementTree as ET
 
-    t0_s1 = time.time()
+    t0_s1 = time.perf_counter()
     try:
         logging.info("[S1] AUTH_START")
         
-        if S3_CRED_CACHE.get("access_id") and time.time() < S3_CRED_CACHE.get("expires_at", 0):
+        import os
+        env_access = os.environ.get("CDSE_S3_ACCESS_KEY")
+        env_secret = os.environ.get("CDSE_S3_SECRET_KEY")
+        
+        if env_access and env_secret:
+            logging.info("[S3] Using configured environment credentials")
+            aws_access_key = env_access
+            aws_secret_key = env_secret
+        elif S3_CRED_CACHE.get("access_id") and time.time() < S3_CRED_CACHE.get("expires_at", 0):
+            logging.info("[S3] Using cached credentials")
             aws_access_key = S3_CRED_CACHE["access_id"]
             aws_secret_key = S3_CRED_CACHE["secret"]
         else:
+            logging.info("[S3] Requesting temporary credentials")
             s3_cred_url = "https://s3-keys-manager.cloudferro.com/api/user/credentials"
             cred_resp = requests.post(s3_cred_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
-            if not cred_resp.ok:
+            if cred_resp.status_code == 403 and "Max number of credentials reached" in cred_resp.text:
+                logging.info("[S3] Temporary credential request blocked by credential limit")
+                raise ValueError(f"Failed to fetch S3 credentials: {cred_resp.status_code} {cred_resp.text}")
+            elif not cred_resp.ok:
                 raise ValueError(f"Failed to fetch S3 credentials: {cred_resp.status_code} {cred_resp.text}")
             
             s3_creds = cred_resp.json()
-            
             aws_access_key = s3_creds["access_id"]
             aws_secret_key = s3_creds["secret"]
             S3_CRED_CACHE["access_id"] = aws_access_key
             S3_CRED_CACHE["secret"] = aws_secret_key
             S3_CRED_CACHE["expires_at"] = time.time() + 3600
+            CREATED_S3_CREDENTIALS.add(aws_access_key)
         
         logging.info("[S1] SEARCH_START")
         from datetime import datetime, timedelta
@@ -533,7 +566,7 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
         logging.error(f"[ERROR] S1 processing failed: {e}\n{traceback.format_exc()}")
         logging.error(f"[S1] exact failure/exception: {s1_reason}")
 
-    t_total = time.time() - t0_s1
+    t_total = time.perf_counter() - t0_s1
     logging.info(f"[S1] TOTAL: {t_total:.2f}s")
     logging.info(f"[S1] final response used={str(s1_used).lower()}")
     
