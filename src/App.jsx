@@ -589,7 +589,15 @@ function App() {
                 <div className="flow-step">
                   <div className="step-label">STEP 3 — DECISION</div>
                   <div className="decision-box" style={{borderLeftColor: statusColor(analysisResult.decision)}}>
-                    <strong>DECISION: {statusIcon(analysisResult.decision)} {analysisResult.decision}</strong>
+                    <strong>DECISION: {statusIcon(analysisResult.decision)} {analysisResult.decision === 'SUPPORTED' ? `SUPPORTED AT ${analysisResult.supportedResolution}` : analysisResult.decision}</strong>
+                    
+                    {analysisResult.decision === 'SUPPORTED' && (
+                      <div style={{ margin: '12px 0', padding: '10px', backgroundColor: '#f9fafb', borderRadius: '4px', fontSize: '13px' }}>
+                        <div style={{ marginBottom: '4px' }}><strong>Requested Resolution:</strong> {analysisResult.id === 'ENUMERATION' ? 'L4 — Individual Tree / Crown' : analysisResult.requested}</div>
+                        <div><strong>Supported Resolution:</strong> {analysisResult.supportedResolution === 'L3' ? 'L3 — Canopy Object / Density' : analysisResult.supportedResolution}</div>
+                      </div>
+                    )}
+                    
                     <p>{analysisResult.reason}</p>
                   </div>
                 </div>
