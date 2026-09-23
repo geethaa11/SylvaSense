@@ -146,7 +146,8 @@ function App() {
       requested: type === 'ENUMERATION' ? 'Individual tree enumeration' : type === 'STRUCTURE' ? 'Canopy cover / structure' : type === 'BIOMASS' ? 'Stand-level AGB estimation' : 'Disturbance / Change',
       required: [
           { name: 'Live API Connection', status: 'UNSUPPORTED' },
-          { name: 'Sentinel-2 Raster Data', status: 'UNSUPPORTED' }
+          { name: 'Sentinel-2 Raster Data', status: 'UNSUPPORTED' },
+          { name: 'Sentinel-1 Calibrated SAR Evidence', status: 'UNSUPPORTED' }
       ],
       availableSummary: data.metadata_found ? `Found scene ${data.metadata_found.scene_id} but processing failed.` : 'No satellite data retrieved.',
       decision: 'REVIEW',
@@ -219,7 +220,8 @@ function App() {
         requested: type === 'ENUMERATION' ? 'Individual tree enumeration' : type === 'STRUCTURE' ? 'Canopy cover / structure' : type === 'BIOMASS' ? 'Stand-level AGB estimation' : 'Disturbance / Change',
         required: [
             { name: 'Live API Connection', status: 'SUPPORTED' },
-            { name: 'Sentinel-2 Raster Data', status: 'SUPPORTED' }
+            { name: 'Sentinel-2 Raster Data', status: 'SUPPORTED' },
+            { name: 'Sentinel-1 Calibrated SAR Evidence', status: meta.sentinel1_used ? 'SUPPORTED' : 'UNSUPPORTED' }
         ],
         decision: data.status,
         supportedResolution: data.resolution ? data.resolution.supported : 'L3',
@@ -240,7 +242,8 @@ function App() {
         },
         validationZones: [],
         evidenceProfile: { optical: 'B04, B08 processed', sar: evidenceSar, canopy: 'NDVI segmented', temporal: 'Single scene' },
-      showAgbPipeline: false
+        showAgbPipeline: false,
+        meta: meta
     };
     
     setAnalysisResult(result);
@@ -523,7 +526,7 @@ function App() {
             <div style={{padding: '12px', fontSize: '12px', background: '#f9fafb', borderTop: '1px solid #e0ece0'}}>
               <strong>CURRENT AOI DATA</strong><br/>
               Area: {areaHa.toFixed(2)} ha<br/>
-              Sentinel-2 (10m): Checking LIVE connection | Sentinel-1: Checking LIVE connection
+              Sentinel-2 (10m): LIVE • Sentinel-1 SAR: LIVE
             </div>
             )}
           </section>
@@ -628,6 +631,23 @@ function App() {
                     <strong>EVIDENCE USED:</strong> {analysisResult.evidenceUsed}
                   </div>
                 </div>
+
+                {analysisResult.meta && analysisResult.meta.sentinel1_used && analysisResult.meta.sentinel1_statistics && (
+                  <div className="hero-card" style={{marginTop: '16px', borderTopColor: '#3b82f6'}}>
+                    <div className="hero-header">
+                      <span className="hero-title" style={{color: '#3b82f6'}}>SENTINEL-1 SAR EVIDENCE</span>
+                    </div>
+                    <div className="hero-metric" style={{fontSize: '13px', lineHeight: '1.6'}}>
+                      <strong>Polarization:</strong> {analysisResult.meta.sentinel1_polarizations.join(', ')}<br/>
+                      <strong>Mean calibrated backscatter:</strong> {analysisResult.meta.sentinel1_statistics.vv_mean_db} dB<br/>
+                      <strong>Valid pixels:</strong> {analysisResult.meta.sentinel1_statistics.valid_pixels}<br/>
+                      <strong>Processing:</strong> {analysisResult.meta.sentinel1_processing}
+                    </div>
+                    <div style={{fontSize: '11px', color: '#64748b', marginTop: '12px', borderTop: '1px solid #e2e8f0', paddingTop: '8px'}}>
+                      Sentinel-1 provides supporting SAR evidence for forest structure/condition; it does not independently establish individual-tree detection.
+                    </div>
+                  </div>
+                )}
 
                 <div className="ladder-container">
                   <div className="step-label" style={{marginBottom: '8px'}}>FOREST MEASUREMENT RESOLUTION LADDER</div>
