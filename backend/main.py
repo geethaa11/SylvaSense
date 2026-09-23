@@ -296,9 +296,26 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
     s1_processing_msg = "Unavailable"
     s1_reason = "Unknown"
     
+    import time
+    import numpy as np
+    import rasterio
+    from rasterio.mask import mask
+    import geopandas as gpd
+    import xml.etree.ElementTree as ET
+
+    t0_s1 = time.time()
     try:
-        import time
-        t0_s1 = time.time()
+        logging.info("[S1] AUTH_START")
+        
+        # 1. Get temporary S3 credentials
+        s3_cred_url = "https://s3-keys-manager.cloudferro.com/api/user/credentials"
+        cred_resp = requests.post(s3_cred_url, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        if not cred_resp.ok:
+            raise ValueError(f"Failed to fetch S3 credentials: {cred_resp.status_code} {cred_resp.text}")
+        s3_creds = cred_resp.json()
+        aws_access_key = s3_creds["access_id"]
+        aws_secret_key = s3_creds["secret"]
+        
         logging.info("[S1] SEARCH_START")
         from datetime import datetime, timedelta
         s1_datetime = None
@@ -321,8 +338,6 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
             s1_payload["datetime"] = s1_datetime
             
         stac_search_url = STAC_URL.rstrip('/') + '/search'
-        logging.info(f"[S1] query URL/collection: {stac_search_url} / sentinel-1-grd")
-        
         s1_resp = requests.post(
             stac_search_url, 
             json=s1_payload, 
@@ -332,27 +347,22 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
         logging.info("[S1] SEARCH_END")
         
         s1_asset = None
+        s1_cal_asset = None
         if s1_resp.status_code == 200:
             features = s1_resp.json().get("features", [])
-            logging.info(f"[S1] number of matching items: {len(features)}")
             if len(features) > 0:
                 s1_connected = True
                 s1_feature = features[0]
                 s1_scene_id = s1_feature.get("id")
-                logging.info(f"[S1] selected scene ID: {s1_scene_id}")
                 s1_assets = s1_feature.get("assets", {})
-                logging.info(f"[S1] available asset keys: {list(s1_assets.keys())}")
                 
                 for p in ["vv", "vh", "hh", "hv"]:
                     if p in s1_assets:
                         s1_pol = p.upper()
                         s1_asset = s1_assets[p]
-                        logging.info(f"[S1] selected polarization: {s1_pol}")
-                        
-                        href_type = "default"
-                        if "alternate" in s1_asset and "https" in s1_asset["alternate"]:
-                            href_type = "https alternate"
-                        logging.info(f"[S1] selected asset href type: {href_type}")
+                        cal_key = f"schema-calibration-{p}"
+                        if cal_key in s1_assets:
+                            s1_cal_asset = s1_assets[cal_key]
                         break
                         
                 if not s1_asset:
@@ -362,22 +372,145 @@ def process_sentinel1(token, geom_dict, acq_date, aoi_shape):
         else:
             s1_reason = f"STAC API returned HTTP {s1_resp.status_code}"
             
-        if s1_connected and s1_asset:
-            logging.info("[S1] RASTER_START")
-            t0_clip = time.time()
-            s1_arr, _, _ = get_remote_clipped_band(s1_scene_id, s1_pol, s1_asset, token, aoi_shape)
-            logging.info("[S1] RASTER_END")
+        if s1_connected and s1_asset and s1_cal_asset:
+            logging.info("[S1] COG_OPEN_START")
             
-            t0_ana = time.time()
+            href = s1_asset.get("href")
+            if not href or not href.startswith("s3://"):
+                raise ValueError(f"S1 asset does not have an s3:// href: {href}")
+            
+            vsi_href = href.replace("s3://", "/vsis3/")
+            
+            # Setup S3 Env
+            import os
+            os.environ["AWS_ACCESS_KEY_ID"] = aws_access_key
+            os.environ["AWS_SECRET_ACCESS_KEY"] = aws_secret_key
+            os.environ["AWS_S3_ENDPOINT"] = "eodata.dataspace.copernicus.eu"
+            os.environ["AWS_VIRTUAL_HOSTING"] = "FALSE"
+            os.environ["AWS_HTTPS"] = "YES"
+            
+            with rasterio.Env(
+                GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+                VSI_CACHE="TRUE",
+                CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif,.tiff"
+            ):
+                with rasterio.open(vsi_href) as src:
+                    logging.info("[S1] COG_WINDOW_START")
+                    
+                    min_lon, min_lat, max_lon, max_lat = aoi_shape.bounds
+                    
+                    if src.transform.is_identity and src.gcps[0]:
+                        gcps = src.gcps[0]
+                        X = []
+                        Y_col = []
+                        Y_row = []
+                        for gcp in gcps:
+                            X.append([gcp.x, gcp.y, 1])
+                            Y_col.append(gcp.col)
+                            Y_row.append(gcp.row)
+                            
+                        X = np.array(X)
+                        Y_col = np.array(Y_col)
+                        Y_row = np.array(Y_row)
+                        
+                        coeff_col, _, _, _ = np.linalg.lstsq(X, Y_col, rcond=None)
+                        coeff_row, _, _, _ = np.linalg.lstsq(X, Y_row, rcond=None)
+                        
+                        corners = [
+                            [min_lon, min_lat, 1],
+                            [min_lon, max_lat, 1],
+                            [max_lon, min_lat, 1],
+                            [max_lon, max_lat, 1]
+                        ]
+                        
+                        cols = [np.dot(c, coeff_col) for c in corners]
+                        rows = [np.dot(c, coeff_row) for c in corners]
+                        
+                        # Buffer
+                        min_col = int(max(0, np.min(cols) - 50))
+                        max_col = int(min(src.width, np.max(cols) + 50))
+                        min_row = int(max(0, np.min(rows) - 50))
+                        max_row = int(min(src.height, np.max(rows) + 50))
+                        
+                        col_offset = min_col
+                    else:
+                        # If somehow it has a valid transform (e.g. RTC product)
+                        aoi_gdf = gpd.GeoDataFrame(geometry=[aoi_shape], crs="EPSG:4326")
+                        aoi_gdf_proj = aoi_gdf.to_crs(src.crs)
+                        minx, miny, maxx, maxy = aoi_gdf_proj.total_bounds
+                        from rasterio.windows import from_bounds
+                        win = from_bounds(minx, miny, maxx, maxy, src.transform)
+                        min_row, max_row = int(win.row_off), int(win.row_off + win.height)
+                        min_col, max_col = int(win.col_off), int(win.col_off + win.width)
+                        
+                        min_col = max(0, min_col)
+                        min_row = max(0, min_row)
+                        max_col = min(src.width, max_col)
+                        max_row = min(src.height, max_row)
+                        col_offset = min_col
+                    
+                    from rasterio.windows import Window
+                    read_window = Window.from_slices((min_row, max_row), (min_col, max_col))
+                    s1_arr = src.read(1, window=read_window)
+                    
+                    logging.info(f"[S1] COG_WINDOW_END (Window size: {s1_arr.shape})")
+            
+            logging.info("[S1] CALIBRATION_START")
+            
+            # Fetch calibration XML
+            cal_href = s1_cal_asset["alternate"]["https"]["href"]
+            cal_resp = requests.get(cal_href, headers={"Authorization": f"Bearer {token}"}, timeout=10)
+            if not cal_resp.ok:
+                raise ValueError("Failed to fetch calibration XML")
+                
+            root = ET.fromstring(cal_resp.content)
+            pixels = []
+            sigma_noughts = []
+            
+            for vec in root.findall(".//calibrationVector"):
+                p_elem = vec.find("pixel")
+                s_elem = vec.find("sigmaNought")
+                if p_elem is not None and s_elem is not None:
+                    p_vals = [float(x) for x in p_elem.text.split()]
+                    s_vals = [float(x) for x in s_elem.text.split()]
+                    pixels.extend(p_vals)
+                    sigma_noughts.extend(s_vals)
+            
+            if not pixels:
+                raise ValueError("No calibration vectors found in XML")
+                
+            # Interpolate sigmaNought over columns
+            pixels = np.array(pixels)
+            sigma_noughts = np.array(sigma_noughts)
+            # Sort just in case
+            sort_idx = np.argsort(pixels)
+            pixels = pixels[sort_idx]
+            sigma_noughts = sigma_noughts[sort_idx]
+            
+            h, w = s1_arr.shape
+            col_indices = np.arange(col_offset, col_offset + w)
+            a_lut = np.interp(col_indices, pixels, sigma_noughts)
+            
+            # Broadcast a_lut to the image shape (1D -> 2D)
+            a_lut_2d = np.tile(a_lut, (h, 1))
+            
+            logging.info("[S1] CALIBRATION_END")
+            
             s1_arr_float = s1_arr.astype(np.float32)
             valid_mask = s1_arr_float > 0
             s1_valid_pixels = int(np.sum(valid_mask))
+            
             if s1_valid_pixels > 0:
-                # Basic scaling for Sentinel-1 GRD
-                db_arr = 10 * np.log10(s1_arr_float[valid_mask] + 1e-10)
+                # Apply calibration: sigma0 = DN^2 / A^2
+                dn_sq = s1_arr_float[valid_mask] ** 2
+                a_sq = a_lut_2d[valid_mask] ** 2
+                sigma0 = dn_sq / a_sq
+                
+                # Convert to dB: 10 * log10(sigma0)
+                db_arr = 10 * np.log10(sigma0 + 1e-10)
                 s1_vv_mean = float(np.mean(db_arr))
                 s1_used = True
-                s1_processing_msg = f"{s1_pol} SAR backscatter"
+                s1_processing_msg = f"{s1_pol} Calibrated SAR backscatter"
             else:
                 s1_reason = "No valid S1 pixels within the AOI."
             logging.info("[S1] PROCESSING_END")
